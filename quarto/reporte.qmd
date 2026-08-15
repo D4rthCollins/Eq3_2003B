@@ -9,6 +9,10 @@ format:
 ---
 
 # Etapa 1. Conociendo el negocio
+```{r}
+library(maps)
+map("world")
+```
 
 Para esta primera etapa, empezaremos por cargar las librerías que necesitamos y establecemos algunas opciones de configuración:
 ```{r}
