@@ -6,3 +6,5 @@ renv/staging/
 output/
 
 /.quarto/
+
+**/*.quarto_ipynb
