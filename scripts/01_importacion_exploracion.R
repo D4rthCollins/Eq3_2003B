@@ -240,10 +240,12 @@ datos_2025_largo <- datos_2025 %>%
     values_to = "valor"
   )
 
-write.csv(
+library(readr)
+
+write_csv(
   datos_2025_largo,
-  "data/datos_sima_2025_limpio_largo.csv",
-  row.names = FALSE
+  "data/datos_sima_2025_limpio_largo.csv.gz",
+  na = ""
 )
 
 
