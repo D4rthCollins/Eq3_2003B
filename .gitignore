@@ -8,3 +8,4 @@ output/
 /.quarto/
 
 **/*.quarto_ipynb
+data/raw/
