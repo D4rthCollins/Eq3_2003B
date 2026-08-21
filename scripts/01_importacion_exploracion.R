@@ -9,7 +9,9 @@ library(dplyr)
 library(purrr)
 
 # Ruta de la base original
-ruta_base = "data/BD 2025.xlsx"
+# OJO La base original no se almacena en GitHub.
+# Para ejecutar este script, colocar BD 2025.xlsx en data/raw/
+ruta_base = "data/raw/BD 2025.xlsx"
 
 # Obtener los nombres de las hojas del archivo
 hojas = excel_sheets(ruta_base)
