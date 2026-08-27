@@ -87,6 +87,22 @@ resumen_na %>%
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
+```{r}
+#| label: exportar-datos
+library(writexl)
+
+# CSV
+write.csv(base_completa, "base_completa.csv", row.names = FALSE)
+write.csv(base_analisis, "base_analisis.csv", row.names = FALSE)
+
+# Excel
+# write_xlsx(base_completa, "base_completa.xlsx")
+# write_xlsx(base_analisis, "base_analisis.xlsx")
+
+cat("Archivos guardados en:", getwd(), "\n")
+```
+
+
 O3 contra las demás variables en SO
 PM10 contra las demás variables en SO
 PM2.5 contra las demás variables en SO
@@ -378,8 +394,9 @@ Función para reporte mensual de variable vs relevante
 
 ```{r}
 #| label: fn-serie-continua1
+MES_LIMITE <- 19  # julio 2025 (ajusta este número si tus datos avanzan más adelante)
+
 graficar_serie_continua1 <- function(datos, estacion_sel, objetivo, top_n = 5) {
-  # variables relevantes = las top_n más correlacionadas con el objetivo
   tabla_cor <- analizar_correlacion(datos, estacion_sel, objetivo)
   top_vars  <- head(tabla_cor$variable, top_n)
   vars_plot <- c(objetivo, top_vars)
@@ -390,21 +407,21 @@ graficar_serie_continua1 <- function(datos, estacion_sel, objetivo, top_n = 5) {
       mes_num      = lubridate::month(date),
       mes_continuo = (año - min(año)) * 12 + mes_num
     ) %>%
+    filter(mes_continuo <= MES_LIMITE) %>%   # corta en julio 2025, no diciembre
     group_by(mes_continuo, año, mes_num) %>%
     summarise(across(all_of(vars_plot), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
     pivot_longer(all_of(vars_plot), names_to = "variable", values_to = "valor") %>%
     mutate(variable = factor(variable, levels = vars_plot))
 
-  max_mes <- max(mensual$mes_continuo)
-  etiquetas_mes <- rep(month.abb, 2)[1:max_mes]
+  etiquetas_mes <- rep(month.abb, 2)[1:MES_LIMITE]
 
   ggplot(mensual, aes(x = mes_continuo, y = valor, color = variable)) +
     geom_line(linewidth = 0.7) +
     geom_point(size = 1.2) +
     geom_vline(xintercept = 12.5, linetype = "dashed", color = "grey50") +
     facet_wrap(~variable, scales = "free_y", ncol = 2) +
-    scale_x_continuous(breaks = 1:max_mes, labels = etiquetas_mes, limits = c(1, max_mes)) +
-    scale_color_manual(values = PALETA_VARS, guide = "none") +  # color fijo, sin leyenda (redundante con el título del panel)
+    scale_x_continuous(breaks = 1:MES_LIMITE, labels = etiquetas_mes, limits = c(1, MES_LIMITE)) +
+    scale_color_manual(values = PALETA_VARS, guide = "none") +
     labs(
       title = paste0(objetivo, " y variables relevantes — ", estacion_sel, " (2024–2025 continuo)"),
       x = NULL, y = NULL
@@ -447,6 +464,7 @@ Función para reporte mensual de variable vs relevante
 
 ```{r}
 #| label: fn-serie-continua2
+
 graficar_serie_continua2 <- function(datos, estacion_sel, objetivo, top_n = 5) {
   tabla_cor <- analizar_correlacion(datos, estacion_sel, objetivo)
   top_vars  <- head(tabla_cor$variable, top_n)
@@ -458,6 +476,7 @@ graficar_serie_continua2 <- function(datos, estacion_sel, objetivo, top_n = 5) {
       mes_num      = lubridate::month(date),
       mes_continuo = (año - min(año)) * 12 + mes_num
     ) %>%
+    filter(mes_continuo <= MES_LIMITE) %>%   # corta en julio 2025, no diciembre
     group_by(mes_continuo, año, mes_num) %>%
     summarise(across(all_of(vars_plot), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
     mutate(across(all_of(vars_plot), ~ as.numeric(scale(.x)), .names = "{.col}")) %>%
@@ -467,15 +486,14 @@ graficar_serie_continua2 <- function(datos, estacion_sel, objetivo, top_n = 5) {
       es_objetivo = variable == objetivo
     )
 
-  max_mes <- max(mensual$mes_continuo)
-  etiquetas_mes <- rep(month.abb, 2)[1:max_mes]
+  etiquetas_mes <- rep(month.abb, 2)[1:MES_LIMITE]
 
   ggplot(mensual, aes(x = mes_continuo, y = valor_z, color = variable,
                        linewidth = es_objetivo, alpha = es_objetivo)) +
     geom_line() +
     geom_vline(xintercept = 12.5, linetype = "dashed", color = "grey40") +
-    scale_x_continuous(breaks = 1:max_mes, labels = etiquetas_mes, limits = c(1, max_mes)) +
-    scale_color_manual(values = PALETA_VARS, name = "Variable") +  # <- color fijo por variable
+    scale_x_continuous(breaks = 1:MES_LIMITE, labels = etiquetas_mes, limits = c(1, MES_LIMITE)) +
+    scale_color_manual(values = PALETA_VARS, name = "Variable") +
     scale_linewidth_manual(values = c("TRUE" = 1.3, "FALSE" = 0.7), guide = "none") +
     scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.75), guide = "none") +
     labs(
