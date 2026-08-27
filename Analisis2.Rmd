@@ -1,0 +1,477 @@
+---
+title: "Análisis Etapa 2"
+author: "David Collins"
+date: "2026-08-27"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+library(knitr)
+
+leer_estacion <- function(archivo, hoja, anio) {
+  raw <- read_excel(archivo, sheet = hoja)
+
+  names(raw) <- names(raw) %>%
+    str_remove("\\(.*\\)") %>%
+    str_trim()
+
+  names(raw)[1] <- "date"
+
+  raw %>%
+    mutate(date = as.POSIXct(date, tz = "America/Monterrey")) %>%
+    filter(!is.na(date)) %>%              # descarta la fila de unidades (2025)
+    mutate(
+      across(-date, as.numeric),          # fuerza numérico en todo lo demás
+      estacion = hoja,
+      año = anio
+    ) %>%
+    select(año, estacion, date, everything())
+}
+
+archivo_2024 <- "~/R_Multivariados/2003B_Blank/data/BD 2024.xlsx"
+archivo_2025 <- "~/R_Multivariados/2003B_Blank/data/BD 2025.xlsx"
+
+nte_2024 <- leer_estacion(archivo_2024, "NTE2", 2024)
+se_2024  <- leer_estacion(archivo_2024, "SE3",  2024)
+so_2024  <- leer_estacion(archivo_2024, "SO",   2024)
+
+nte_2025 <- leer_estacion(archivo_2025, "NTE2", 2025)
+se_2025  <- leer_estacion(archivo_2025, "SE3",  2025)
+so_2025  <- leer_estacion(archivo_2025, "SO",   2025)
+
+base_completa <- bind_rows(
+  nte_2024, se_2024, so_2024,
+  nte_2025, se_2025, so_2025
+)
+
+head(base_completa)
+```
+
+Limpiar las variables que no son precursoras del ozono
+
+```{r}
+base_analisis <- base_completa %>%
+  select(
+    año, estacion, date,
+    O3, PM10, PM2.5,                        # contaminantes objetivo
+    NO, NO2, NOX, CO, SO2,                   # precursores de O3
+    TOUT, RH, WSR, WDR, PRS, RAINF, SR       # condiciones climáticas
+  )
+
+resumen_na <- base_analisis %>%
+  group_by(año, estacion) %>%
+  summarise(across(-date, ~ mean(is.na(.)) * 100), .groups = "drop")
+
+resumen_na
+```
+
+```{r}
+resumen_na %>%
+  pivot_longer(-c(año, estacion), names_to = "variable", values_to = "pct_na") %>%
+  mutate(grupo = paste(estacion, año)) %>%
+  ggplot(aes(x = variable, y = grupo, fill = pct_na)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "firebrick", name = "% NA") +
+  labs(x = NULL, y = NULL, title = "Porcentaje de datos faltantes") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+O3 contra las demás variables en SO
+PM10 contra las demás variables en SO
+PM2.5 contra las demás variables en SO
+O3 contra las demás variables en SE3
+PM10 contra las demás variables en SE3
+PM2.5 contra las demás variables en SE3
+O3 contra las demás variables en NTE2
+PM10 contra las demás variables en NTE2
+PM2.5 contra las demás variables en NTE2
+
+```{r}
+numeric_vars <- c("O3","PM10","PM2.5","NO","NO2","NOX","CO","SO2",
+                   "TOUT","RH","WSR","WDR","PRS","RAINF","SR")
+
+TARGETS  <- c("O3", "PM10", "PM2.5")
+STATIONS <- c("SO", "SE3", "NTE2")
+```
+
+Función para estad descript del contam
+```{r}
+#| label: fn-descriptiva
+resumen_descriptivo <- function(datos, estacion_sel, objetivo) {
+  datos %>%
+    filter(estacion == estacion_sel) %>%
+    summarise(
+      n_total   = n(),
+      n_validos = sum(!is.na(.data[[objetivo]])),
+      pct_na    = round(mean(is.na(.data[[objetivo]])) * 100, 1),
+      media     = round(mean(.data[[objetivo]], na.rm = TRUE), 2),
+      mediana   = round(median(.data[[objetivo]], na.rm = TRUE), 2),
+      sd        = round(sd(.data[[objetivo]], na.rm = TRUE), 2),
+      min       = round(min(.data[[objetivo]], na.rm = TRUE), 2),
+      max       = round(max(.data[[objetivo]], na.rm = TRUE), 2)
+    )
+}
+```
+
+Función para cor del contam vs demás variables
+```{r}
+#| label: fn-correlacion
+analizar_correlacion <- function(datos, estacion_sel, objetivo) {
+  df <- datos %>% filter(estacion == estacion_sel) %>% select(all_of(numeric_vars))
+  otras <- setdiff(numeric_vars, objetivo)
+
+  map_dfr(otras, function(v) {
+    # solo pares completos para ESA combinación (respetamos tu decisión
+    # de no imputar ni tocar los NA globalmente)
+    par <- df %>% select(all_of(c(objetivo, v))) %>% drop_na()
+    ct <- cor.test(par[[objetivo]], par[[v]])
+    tibble(
+      variable = v,
+      r        = round(unname(ct$estimate), 3),
+      p_value  = signif(ct$p.value, 3),
+      n_pares  = nrow(par)
+    )
+  }) %>%
+    arrange(desc(abs(r)))
+}
+```
+
+Función para heatmap correlación entre variables
+
+```{r}
+#| label: fn-heatmap
+graficar_heatmap <- function(datos, estacion_sel) {
+  mat_cor <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(numeric_vars)) %>%
+    cor(use = "pairwise.complete.obs")  # respeta los NA, usa pares completos por celda
+
+  mat_cor %>%
+    as_tibble(rownames = "var1") %>%
+    pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+    mutate(
+      var1 = factor(var1, levels = numeric_vars),
+      var2 = factor(var2, levels = rev(numeric_vars))
+    ) %>%
+    ggplot(aes(var1, var2, fill = r)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f", r)), size = 2.8) +
+    scale_fill_gradient2(
+      low = "steelblue", mid = "white", high = "firebrick",
+      midpoint = 0, limits = c(-1, 1), name = "r"
+    ) +
+    labs(title = paste("Matriz de correlación —", estacion_sel), x = NULL, y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(face = "bold")
+    ) +
+    coord_fixed()
+}
+```
+
+Función para dispersión del contam vs cada variable
+```{r}
+#| label: fn-dispersion
+graficar_dispersion_individual <- function(datos, estacion_sel, objetivo, tabla_cor) {
+  df <- datos %>% filter(estacion == estacion_sel)
+  otras <- setdiff(numeric_vars, objetivo)
+
+  map(otras, function(v) {
+    par <- df %>% select(all_of(c(objetivo, v))) %>% drop_na()
+
+    info_cor <- tabla_cor %>% filter(variable == v)
+    subtitulo <- sprintf("r = %.3f | p = %s | n = %d",
+                          info_cor$r, format(info_cor$p_value, scientific = TRUE, digits = 2),
+                          info_cor$n_pares)
+
+    ggplot(par, aes(x = .data[[v]], y = .data[[objetivo]])) +
+      geom_point(alpha = 0.15, size = 0.6) +
+      geom_smooth(method = "lm", se = FALSE, color = "firebrick", linewidth = 0.7) +
+      labs(
+        title = paste0(objetivo, " vs. ", v, " — ", estacion_sel),
+        subtitle = subtitulo,
+        x = v, y = objetivo
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(plot.title = element_text(face = "bold"))
+  }) %>%
+    set_names(otras)
+}
+```
+
+Función para PCA por estación
+```{r}
+#| label: fn-pca
+analizar_pca <- function(datos, estacion_sel) {
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(numeric_vars)) %>%
+    drop_na()  # el PCA exige casos completos, sin excepción
+
+  pca <- prcomp(df, center = TRUE, scale. = TRUE)
+  list(pca = pca, n = nrow(df),
+       n_total = sum(datos$estacion == estacion_sel))
+}
+
+graficar_pca <- function(pca_res) {
+  pca <- pca_res$pca
+  var_exp <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+  scree <- ggplot(tibble(PC = factor(seq_along(var_exp)), var_exp),
+                   aes(PC, var_exp)) +
+    geom_col(fill = "steelblue") +
+    labs(x = "Componente", y = "% Varianza explicada", title = "Scree plot")
+
+  loadings <- as_tibble(pca$rotation[, 1:2], rownames = "variable")
+  scores   <- as_tibble(pca$x[, 1:2])
+  esc <- max(abs(scores$PC1), abs(scores$PC2)) /
+         max(abs(loadings$PC1), abs(loadings$PC2)) * 0.8
+
+  biplot <- ggplot() +
+    geom_point(data = scores, aes(PC1, PC2), alpha = 0.08, size = 0.5, color = "grey40") +
+    geom_segment(data = loadings,
+                 aes(x = 0, y = 0, xend = PC1 * esc, yend = PC2 * esc),
+                 arrow = arrow(length = unit(0.2, "cm")), color = "firebrick") +
+    geom_text(data = loadings,
+              aes(x = PC1 * esc * 1.15, y = PC2 * esc * 1.15, label = variable),
+              color = "firebrick", size = 3) +
+    labs(x = paste0("PC1 (", round(var_exp[1], 1), "%)"),
+         y = paste0("PC2 (", round(var_exp[2], 1), "%)"),
+         title = "Biplot PCA")
+
+  list(scree = scree, biplot = biplot, loadings = round(loadings[, -1], 3) %>%
+         mutate(variable = loadings$variable, .before = 1))
+}
+```
+
+Ciclo generador de las funciones anteriores
+
+```{r}
+#| label: fn-reporte-estacion
+generar_reporte_estacion <- function(datos, estacion_sel) {
+
+  N_TOP <- 8
+
+  cat("\n\n## Estación:", estacion_sel, "\n\n")
+
+  # --- Matriz de correlación ---
+  cat("### Matriz de correlación —", estacion_sel, "\n\n")
+  print(graficar_heatmap(datos, estacion_sel))
+
+  # --- PCA ---
+  cat("\n\n### Componentes principales —", estacion_sel, "\n\n")
+  pca_res <- analizar_pca(datos, estacion_sel)
+  cat(sprintf("_PCA calculado sobre %d de %d observaciones (%.1f%% con datos completos)._\n\n",
+              pca_res$n, pca_res$n_total, 100 * pca_res$n / pca_res$n_total))
+
+  pca_plots <- graficar_pca(pca_res)
+  print(pca_plots$scree)
+  print(pca_plots$biplot)
+  cat("\n\n**Cargas en PC1 y PC2:**\n\n")
+  print(kable(pca_plots$loadings))
+
+  # --- Por cada contaminante objetivo ---
+  for (objetivo in TARGETS) {
+    cat("\n\n### ", objetivo, " vs. demás variables — ", estacion_sel, "\n\n", sep = "")
+
+    cat("**Estadística descriptiva:**\n\n")
+    print(kable(resumen_descriptivo(datos, estacion_sel, objetivo)))
+
+    cat("\n\n**Correlación de Pearson (ordenada por fuerza):**\n\n")
+    tabla_cor <- analizar_correlacion(datos, estacion_sel, objetivo)
+    print(kable(tabla_cor))
+
+    top_vars  <- head(tabla_cor$variable, N_TOP)
+    rest_vars <- setdiff(tabla_cor$variable, top_vars)
+
+    cat("\n\n**Relaciones más fuertes (gráficas individuales):**\n\n")
+    plots_top <- graficar_dispersion_individual(datos, estacion_sel, objetivo, tabla_cor)
+    for (v in top_vars) {
+      print(plots_top[[v]])
+      cat("\n\n")
+    }
+
+    if (length(rest_vars) > 0) {
+      cat("\n\n**Resto de variables en grid (referencia):**\n\n")
+      print(graficar_dispersion_grid(datos, estacion_sel, objetivo, rest_vars))
+    }
+  }
+}
+```
+
+Resultados por estación:
+
+```{r}
+#| label: comparativo-SO
+#| results: asis
+#| warning: false
+#| message: false
+generar_reporte_estacion(base_analisis, "SO")
+```
+```{r}
+#| label: comparativo-SE3
+#| results: asis
+#| warning: false
+#| message: false
+generar_reporte_estacion(base_analisis, "SE3")
+```
+
+```{r}
+#| label: comparativo-NTE2
+#| results: asis
+#| warning: false
+#| message: false
+generar_reporte_estacion(base_analisis, "NTE2")
+```
+
+Función para reporte mensual de variable vs relevante
+(Variables por separado y respetando sus unidades)
+
+```{r}
+#| label: fn-serie-continua
+graficar_serie_continua <- function(datos, estacion_sel, objetivo, top_n = 5) {
+  # variables relevantes = las top_n más correlacionadas con el objetivo
+  tabla_cor <- analizar_correlacion(datos, estacion_sel, objetivo)
+  top_vars  <- head(tabla_cor$variable, top_n)
+  vars_plot <- c(objetivo, top_vars)
+
+  mensual <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    mutate(
+      mes_num      = lubridate::month(date),
+      mes_continuo = (año - min(año)) * 12 + mes_num  # 1..12 = 2024, 13..24 = 2025
+    ) %>%
+    group_by(mes_continuo, año, mes_num) %>%
+    summarise(across(all_of(vars_plot), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    pivot_longer(all_of(vars_plot), names_to = "variable", values_to = "valor") %>%
+    mutate(variable = factor(variable, levels = vars_plot))
+
+  etiquetas_mes <- rep(month.abb, 2)
+
+  ggplot(mensual, aes(x = mes_continuo, y = valor)) +
+    geom_line(color = "steelblue", linewidth = 0.7) +
+    geom_point(size = 1.2, color = "steelblue") +
+    geom_vline(xintercept = 12.5, linetype = "dashed", color = "grey50") +
+    facet_wrap(~variable, scales = "free_y", ncol = 2) +
+    scale_x_continuous(breaks = 1:24, labels = etiquetas_mes) +
+    labs(
+      title = paste0(objetivo, " y variables relevantes — ", estacion_sel, " (2024–2025 continuo)"),
+      x = NULL, y = NULL
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      plot.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold")
+    )
+}
+```
+
+```{r}
+#| label: serie-continua-SO
+#| warning: false
+graficar_serie_continua(base_analisis, "SO", "O3")
+graficar_serie_continua(base_analisis, "SO", "PM10")
+graficar_serie_continua(base_analisis, "SO", "PM2.5")
+```
+
+```{r}
+#| label: serie-continua-SE3
+#| warning: false
+graficar_serie_continua(base_analisis, "SE3", "O3")
+graficar_serie_continua(base_analisis, "SE3", "PM10")
+graficar_serie_continua(base_analisis, "SE3", "PM2.5")
+```
+
+```{r}
+#| label: serie-continua-NTE2
+#| warning: false
+graficar_serie_continua(base_analisis, "NTE2", "O3")
+graficar_serie_continua(base_analisis, "NTE2", "PM10")
+graficar_serie_continua(base_analisis, "NTE2", "PM2.5")
+```
+
+Función para reporte mensual de variable vs relevante
+(Variables normalizadas para juntar grafico)
+
+```{r}
+#| label: fn-serie-continua
+graficar_serie_continua <- function(datos, estacion_sel, objetivo, top_n = 5) {
+  tabla_cor <- analizar_correlacion(datos, estacion_sel, objetivo)
+  top_vars  <- head(tabla_cor$variable, top_n)
+  vars_plot <- c(objetivo, top_vars)
+
+  mensual <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    mutate(
+      mes_num      = lubridate::month(date),
+      mes_continuo = (año - min(año)) * 12 + mes_num
+    ) %>%
+    group_by(mes_continuo, año, mes_num) %>%
+    summarise(across(all_of(vars_plot), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+    # Estandarización (z-score): permite comparar variables con unidades
+    # distintas (ppb, µg/m3, °C, km/h...) en el mismo eje Y sin distorsión
+    mutate(across(all_of(vars_plot), ~ as.numeric(scale(.x)), .names = "{.col}")) %>%
+    pivot_longer(all_of(vars_plot), names_to = "variable", values_to = "valor_z") %>%
+    mutate(
+      variable = factor(variable, levels = vars_plot),
+      es_objetivo = variable == objetivo
+    )
+
+  etiquetas_mes <- rep(month.abb, 2)
+
+  ggplot(mensual, aes(x = mes_continuo, y = valor_z, color = variable,
+                       linewidth = es_objetivo, alpha = es_objetivo)) +
+    geom_line() +
+    geom_vline(xintercept = 12.5, linetype = "dashed", color = "grey40") +
+    scale_x_continuous(breaks = 1:24, labels = etiquetas_mes) +
+    scale_linewidth_manual(values = c("TRUE" = 1.3, "FALSE" = 0.7), guide = "none") +
+    scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.75), guide = "none") +
+    labs(
+      title = paste0(objetivo, " y variables relevantes — ", estacion_sel, " (2024–2025 continuo)"),
+      subtitle = "Valores estandarizados (z-score) para comparar en la misma escala",
+      x = NULL, y = "Valor estandarizado (z-score)", color = "Variable"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      plot.title = element_text(face = "bold")
+    )
+}
+```
+
+```{r}
+#| label: serie-continua-SO
+#| warning: false
+graficar_serie_continua(base_analisis, "SO", "O3")
+graficar_serie_continua(base_analisis, "SO", "PM10")
+graficar_serie_continua(base_analisis, "SO", "PM2.5")
+```
+
+```{r}
+#| label: serie-continua-SE3
+#| warning: false
+graficar_serie_continua(base_analisis, "SE3", "O3")
+graficar_serie_continua(base_analisis, "SE3", "PM10")
+graficar_serie_continua(base_analisis, "SE3", "PM2.5")
+```
+
+```{r}
+#| label: serie-continua-NTE2
+#| warning: false
+graficar_serie_continua(base_analisis, "NTE2", "O3")
+graficar_serie_continua(base_analisis, "NTE2", "PM10")
+graficar_serie_continua(base_analisis, "NTE2", "PM2.5")
+```

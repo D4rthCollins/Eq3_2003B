@@ -1,0 +1,193 @@
+---
+title: "Análisis de datos 2024-2025"
+format: pdf
+editor: visual
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(readxl)
+library(scales)
+library(knitr)
+library(dplyr)
+library(purrr)
+
+theme_set(theme_minimal(base_size = 11))
+
+STATIONS <- c("NTE2", "SE3", "SO")
+POLLUTANTS <- c("O3", "PM10", "PM2.5")
+
+# Normas mexicanas de referencia (NOM-020-SSA1-2021 / NOM-025-SSA1-2021)
+LIMITS <- c(O3 = 90, PM10 = 75, "PM2.5" = 45)
+
+FILE_2024 <- "~/R_Multivariados/2003B_Blank/data/BD 2024.xlsx"
+FILE_2025 <- "~/R_Multivariados/2003B_Blank/data/BD 2025.xlsx"
+```
+
+```{r}
+#| label: load-data
+
+load_station <- function(path, sheet, year) {
+  raw <- read_excel(path, sheet = sheet)
+
+  names(raw) <- names(raw) %>%
+    str_remove("\\(.*\\)") %>%
+    str_trim()
+  names(raw)[1] <- "date"
+
+  raw %>%
+    mutate(date = as.POSIXct(date, tz = "America/Monterrey")) %>%
+    filter(!is.na(date)) %>%
+    mutate(
+      station = sheet,
+      year = year,
+      across(all_of(POLLUTANTS), as.numeric)
+    ) %>%
+    select(date, station, year, any_of(POLLUTANTS))
+}
+
+stopifnot(
+  "FILE_2024 debe ser un string" = is.character(FILE_2024) && length(FILE_2024) == 1,
+  "FILE_2025 debe ser un string" = is.character(FILE_2025) && length(FILE_2025) == 1
+)
+
+file_year <- list(
+  list(path = FILE_2024, year = 2024),
+  list(path = FILE_2025, year = 2025)
+)
+
+data_list <- list()
+for (fy in file_year) {
+  for (st in STATIONS) {
+    key <- paste(fy$year, st)
+    message("Leyendo: ", fy$path, " | hoja: ", st)
+    data_list[[key]] <- load_station(fy$path, st, fy$year)
+  }
+}
+
+data <- bind_rows(data_list) %>%
+  mutate(
+    month = lubridate::month(date),
+    hour = lubridate::hour(date)
+  )
+```
+
+# Introducción
+
+Este reporte analiza las concentraciones de **ozono (O3)**, **partículas PM10** y **partículas PM2.5** registradas en las estaciones de monitoreo **NTE2**, **SE3** y **SO**, comparando el comportamiento entre 2024 y 2025.
+
+# Calidad de los datos
+
+Antes de cualquier análisis, es indispensable cuantificar los datos faltantes por estación, año y contaminante — en tu captura ya se ven celdas vacías en PM2.5 y RAINF.
+
+```{r}
+#| label: tbl-missing
+missing_tbl <- data %>%
+  group_by(station, year) %>%
+  summarise(across(all_of(POLLUTANTS), ~ mean(is.na(.)) * 100), .groups = "drop")
+
+kable(missing_tbl, digits = 1, caption = "Porcentaje de datos faltantes")
+```
+
+```{r}
+#| label: fig-missing
+#| fig-cap: "Porcentaje de datos faltantes por estación, año y contaminante"
+missing_tbl %>%
+  pivot_longer(all_of(POLLUTANTS), names_to = "pollutant", values_to = "pct_missing") %>%
+  mutate(group = paste(station, year, sep = " - ")) %>%
+  ggplot(aes(x = group, y = pct_missing, fill = pollutant)) +
+  geom_col(position = "dodge") +
+  labs(x = NULL, y = "% faltante", fill = "Contaminante") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Estadística descriptiva
+
+```{r}
+#| label: tbl-descriptive
+desc_tbl <- data %>%
+  group_by(station, year) %>%
+  summarise(across(
+    all_of(POLLUTANTS),
+    list(media = ~ mean(.x, na.rm = TRUE),
+         sd = ~ sd(.x, na.rm = TRUE),
+         min = ~ min(.x, na.rm = TRUE),
+         mediana = ~ median(.x, na.rm = TRUE),
+         max = ~ max(.x, na.rm = TRUE)),
+    .names = "{.col}_{.fn}"
+  ), .groups = "drop")
+
+kable(desc_tbl, digits = 2)
+```
+
+# Series de tiempo: promedio mensual
+
+```{r}
+#| label: fig-monthly
+#| fig-cap: "Promedio mensual por estación y contaminante (2024 vs 2025)"
+monthly <- data %>%
+  group_by(station, year, month) %>%
+  summarise(across(all_of(POLLUTANTS), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_longer(all_of(POLLUTANTS), names_to = "pollutant", values_to = "value")
+
+limits_df <- tibble(pollutant = names(LIMITS), limite = LIMITS)
+
+monthly %>%
+  left_join(limits_df, by = "pollutant") %>%
+  ggplot(aes(x = month, y = value, color = station, linetype = factor(year))) +
+  geom_line() +
+  geom_point(size = 1) +
+  geom_hline(aes(yintercept = limite), color = "red", linetype = "dotted") +
+  facet_wrap(~pollutant, scales = "free_y", ncol = 1) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(x = "Mes", y = "Concentración", color = "Estación", linetype = "Año")
+```
+
+# Comparación entre estaciones
+
+```{r}
+#| label: fig-boxplot-stations
+#| fig-cap: "Distribución de concentraciones por estación y contaminante"
+data %>%
+  pivot_longer(all_of(POLLUTANTS), names_to = "pollutant", values_to = "value") %>%
+  left_join(limits_df, by = "pollutant") %>%
+  ggplot(aes(x = station, y = value, fill = factor(year))) +
+  geom_boxplot(outlier.size = 0.5) +
+  geom_hline(aes(yintercept = limite), color = "red", linetype = "dotted") +
+  facet_wrap(~pollutant, scales = "free_y") +
+  labs(x = "Estación", y = "Concentración", fill = "Año")
+```
+
+# Patrón diario (perfil horario)
+
+```{r}
+#| label: fig-hourly
+#| fig-cap: "Perfil horario promedio por contaminante y estación"
+hourly <- data %>%
+  group_by(station, year, hour) %>%
+  summarise(across(all_of(POLLUTANTS), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  pivot_longer(all_of(POLLUTANTS), names_to = "pollutant", values_to = "value")
+
+hourly %>%
+  ggplot(aes(x = hour, y = value, color = station, linetype = factor(year))) +
+  geom_line() +
+  facet_wrap(~pollutant, scales = "free_y", ncol = 1) +
+  labs(x = "Hora del día", y = "Concentración", color = "Estación", linetype = "Año")
+```
+
+# Excedencias a límites de referencia
+
+```{r}
+#| label: tbl-exceedances
+exceed_tbl <- data %>%
+  group_by(station, year) %>%
+  summarise(
+    O3_excede = sum(O3 > LIMITS["O3"], na.rm = TRUE),
+    PM10_excede = sum(PM10 > LIMITS["PM10"], na.rm = TRUE),
+    PM2.5_excede = sum(`PM2.5` > LIMITS["PM2.5"], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(exceed_tbl, caption = "Horas con concentración por encima del límite de referencia")
+```
