@@ -21,6 +21,9 @@ POLLUTANTS <- c("O3", "PM10", "PM2.5")
 # Normas mexicanas de referencia (NOM-020-SSA1-2021 / NOM-025-SSA1-2021)
 LIMITS <- c(O3 = 90, PM10 = 75, "PM2.5" = 45)
 
+FILE_2021 = "~/R_Multivariados/2003B_Blank/data/BD 2021.xlsx"
+FILE_2022 = "~/R_Multivariados/2003B_Blank/data/BD 2022.xlsx"
+FILE_2023 = "~/R_Multivariados/2003B_Blank/data/BD 2023.xlsx"
 FILE_2024 <- "~/R_Multivariados/2003B_Blank/data/BD 2024.xlsx"
 FILE_2025 <- "~/R_Multivariados/2003B_Blank/data/BD 2025.xlsx"
 ```
@@ -49,10 +52,16 @@ load_station <- function(path, sheet, year) {
 
 stopifnot(
   "FILE_2024 debe ser un string" = is.character(FILE_2024) && length(FILE_2024) == 1,
-  "FILE_2025 debe ser un string" = is.character(FILE_2025) && length(FILE_2025) == 1
-)
+  "FILE_2025 debe ser un string" = is.character(FILE_2025) && length(FILE_2025) == 1,
+  "FILE_2024 debe ser un string" = is.character(FILE_2024) && length(FILE_2023) == 1,
+  "FILE_2025 debe ser un string" = is.character(FILE_2025) && length(FILE_2022) == 1,
+  "FILE_2024 debe ser un string" = is.character(FILE_2024) && length(FILE_2021) == 1
+  )
 
 file_year <- list(
+  list(path = FILE_2024, year = 2021),
+  list(path = FILE_2024, year = 2022),
+  list(path = FILE_2024, year = 2023),
   list(path = FILE_2024, year = 2024),
   list(path = FILE_2025, year = 2025)
 )
