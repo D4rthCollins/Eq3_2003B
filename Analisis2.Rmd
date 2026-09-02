@@ -13,11 +13,20 @@ knitr::opts_chunk$set(echo = TRUE)
 library(readxl)
 library(dplyr)
 library(tidyr)
+library(tibble)
 library(stringr)
 library(ggplot2)
+library(psych)
+library(corpcor)
 library(purrr)
+library(lmtest)
+library(nortest)
+library(car)
 library(knitr)
+library(zoo)
+```
 
+```{r}
 leer_estacion <- function(archivo, hoja, anio) {
   raw <- read_excel(archivo, sheet = hoja)
 
@@ -82,7 +91,7 @@ base_analisis <- base_completa %>%
   select(
     año, estacion, date,
     O3, PM10, PM2.5,                        # contaminantes objetivo
-    NO, NO2, NOX, CO, SO2,                   # precursores de O3
+    NO, NO2, CO, SO2,                   # precursores de O3
     TOUT, RH, WSR, WDR, PRS, RAINF, SR       # condiciones climáticas
   )
 
@@ -96,8 +105,7 @@ resumen_na
 Limpiar los valores negativos, excepto de la temperatura
 
 ```{r}
-vars_no_negativas <- c("O3", "PM10", "PM2.5", "NO", "NO2", "NOX", "CO", "SO2",
-                        "RH", "WSR", "WDR", "PRS", "RAINF", "SR")
+vars_no_negativas <- c("O3", "PM10", "PM2.5", "NO", "NO2", "CO", "SO2", "RH", "WSR", "WDR", "PRS", "RAINF", "SR")
 
 base_analisis <- base_completa %>%
   mutate(across(all_of(vars_no_negativas), ~ ifelse(.x < 0, NA, .x)))
@@ -156,7 +164,7 @@ PM10 contra las demás variables en NTE2
 PM2.5 contra las demás variables en NTE2
 
 ```{r}
-numeric_vars <- c("O3","PM10","PM2.5","NO","NO2","NOX","CO","SO2",
+numeric_vars <- c("O3","PM10","PM2.5","NO","NO2","CO","SO2",
                    "TOUT","RH","WSR","WDR","PRS","RAINF","SR")
 
 TARGETS  <- c("O3", "PM10", "PM2.5")
@@ -168,7 +176,6 @@ PALETA_VARS <- c(
   "PM2.5" = "#FF7F00",  # naranja
   "NO"    = "#377EB8",  # azul
   "NO2"   = "#4DAF4A",  # verde
-  "NOX"   = "#00CED1",  # turquesa
   "CO"    = "#A65628",  # café
   "SO2"   = "#F781BF",  # rosa
   "TOUT"  = "#999999",  # gris
@@ -200,60 +207,109 @@ resumen_descriptivo <- function(datos, estacion_sel, objetivo) {
 }
 ```
 
-Función para cor del contam vs demás variables
 ```{r}
-#| label: fn-correlacion
-analizar_correlacion <- function(datos, estacion_sel, objetivo) {
-  df <- datos %>% filter(estacion == estacion_sel) %>% select(all_of(numeric_vars))
-  otras <- setdiff(numeric_vars, objetivo)
+#| label: analisis-descriptivo
+#| results: asis
 
-  map_dfr(otras, function(v) {
-    # solo pares completos para ESA combinación (respetamos tu decisión
-    # de no imputar ni tocar los NA globalmente)
-    par <- df %>% select(all_of(c(objetivo, v))) %>% drop_na()
-    ct <- cor.test(par[[objetivo]], par[[v]])
-    tibble(
-      variable = v,
-      r        = round(unname(ct$estimate), 3),
-      p_value  = signif(ct$p.value, 3),
-      n_pares  = nrow(par)
-    )
-  }) %>%
-    arrange(desc(abs(r)))
+for (estacion_sel in STATIONS) {
+  cat("\n\n## Estación:", estacion_sel, "\n\n")
+
+  for (objetivo in TARGETS) {
+    cat("\n\n### ", objetivo, " — ", estacion_sel, "\n\n", sep = "")
+    print(kable(resumen_descriptivo(base_analisis, estacion_sel, objetivo)))
+  }
 }
 ```
 
-Función para heatmap correlación entre variables
-
+funcion para correlaciones completas (simple y parcial)
 ```{r}
-#| label: fn-heatmap
-graficar_heatmap <- function(datos, estacion_sel) {
-  mat_cor <- datos %>%
+#| label: fn-correlaciones-completas
+analizar_correlaciones_estacion <- function(datos, estacion_sel) {
+  df <- datos %>%
     filter(estacion == estacion_sel) %>%
     select(all_of(numeric_vars)) %>%
-    cor(use = "pairwise.complete.obs")  # respeta los NA, usa pares completos por celda
+    drop_na()
 
-  mat_cor %>%
+  mat_cor  <- cor(df)
+  mat_pcor <- corpcor::cor2pcor(mat_cor)
+  dimnames(mat_pcor) <- dimnames(mat_cor)
+
+  list(
+    cor     = mat_cor,
+    pcor    = mat_pcor,
+    n       = nrow(df),
+    n_total = sum(datos$estacion == estacion_sel)
+  )
+}
+
+# Reutilizable para graficar cualquier matriz (correlación simple o parcial)
+graficar_matriz <- function(mat, titulo) {
+  mat %>%
     as_tibble(rownames = "var1") %>%
-    pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+    pivot_longer(-var1, names_to = "var2", values_to = "valor") %>%
     mutate(
       var1 = factor(var1, levels = numeric_vars),
       var2 = factor(var2, levels = rev(numeric_vars))
     ) %>%
-    ggplot(aes(var1, var2, fill = r)) +
+    ggplot(aes(var1, var2, fill = valor)) +
     geom_tile(color = "white") +
-    geom_text(aes(label = sprintf("%.2f", r)), size = 1.5) +
-    scale_fill_gradient2(
-      low = "steelblue", mid = "white", high = "firebrick",
-      midpoint = 0, limits = c(-1, 1), name = "r"
-    ) +
-    labs(title = paste("Matriz de correlación —", estacion_sel), x = NULL, y = NULL) +
-    theme_minimal(base_size = 10) +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1),
-      plot.title = element_text(face = "bold")
-    ) +
+    geom_text(aes(label = sprintf("%.2f", valor)), size = 2.6) +
+    scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                          midpoint = 0, limits = c(-1, 1), name = NULL) +
+    labs(title = titulo, x = NULL, y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(face = "bold")) +
     coord_fixed()
+}
+```
+
+```{r}
+#| label: correlaciones-SO
+#| warning: false
+cor_SO <- analizar_correlaciones_estacion(base_analisis, "SO")
+graficar_matriz(cor_SO$cor,  "Correlación simple — SO")
+graficar_matriz(cor_SO$pcor, "Correlación parcial — SO")
+```
+
+```{r}
+#| label: correlaciones-SE3
+#| warning: false
+cor_SE3 <- analizar_correlaciones_estacion(base_analisis, "SE3")
+graficar_matriz(cor_SE3$cor,  "Correlación simple — SE3")
+graficar_matriz(cor_SE3$pcor, "Correlación parcial — SE3")
+```
+
+```{r}
+#| label: correlaciones-NTE2
+#| warning: false
+cor_NTE2 <- analizar_correlaciones_estacion(base_analisis, "NTE2")
+graficar_matriz(cor_NTE2$cor,  "Correlación simple — NTE2")
+graficar_matriz(cor_NTE2$pcor, "Correlación parcial — NTE2")
+```
+
+Otras ejecuciones dependen de analizar la correlacion
+```{r}
+#| label: fn-analizar-correlacion
+
+analizar_correlacion <- function(datos, estacion_sel, objetivo) {
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(numeric_vars)) %>%
+    drop_na()
+  
+  otras <- setdiff(numeric_vars, objetivo)
+  
+  map_df(otras, function(v) {
+    prueba <- cor.test(df[[objetivo]], df[[v]], method = "pearson")
+    tibble(
+      variable = v,
+      r        = round(prueba$estimate, 3),
+      p_value  = prueba$p.value,
+      n_pares  = sum(!is.na(df[[objetivo]]) & !is.na(df[[v]]))
+    )
+  }) %>%
+    arrange(desc(abs(r)))
 }
 ```
 
@@ -351,43 +407,39 @@ graficar_pca <- function(pca_res) {
 }
 ```
 
-Ciclo generador de las funciones anteriores
+Ciclo generador del PCA
 
 ```{r}
 #| label: fn-reporte-estacion
 generar_reporte_estacion <- function(datos, estacion_sel) {
-
   N_TOP <- 8
-
   cat("\n\n## Estación:", estacion_sel, "\n\n")
 
-  # --- Matriz de correlación ---
-  cat("### Matriz de correlación —", estacion_sel, "\n\n")
-  print(graficar_heatmap(datos, estacion_sel))
-
   # --- PCA ---
-  cat("\n\n### Componentes principales —", estacion_sel, "\n\n")
+  cat("### Componentes principales —", estacion_sel, "\n\n")
   pca_res <- analizar_pca(datos, estacion_sel)
   cat(sprintf("_PCA calculado sobre %d de %d observaciones (%.1f%% con datos completos)._\n\n",
               pca_res$n, pca_res$n_total, 100 * pca_res$n / pca_res$n_total))
 
+  # Scree plot combinado PCA + FA (psych::scree), en vez del scree manual de ggplot
+  df_completo <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(numeric_vars)) %>%
+    drop_na()
+
+  psych::scree(df_completo, factors = TRUE, pc = TRUE,
+               main = paste("Scree plot (PCA y FA) —", estacion_sel))
+
   pca_plots <- graficar_pca(pca_res)
-  print(pca_plots$scree)
   print(pca_plots$biplot)
   cat("\n\n**Cargas en PC1 y PC2:**\n\n")
   print(kable(pca_plots$loadings))
 
-  # --- Por cada contaminante objetivo ---
+  # --- Por cada contaminante objetivo: solo gráficas de dispersión ---
   for (objetivo in TARGETS) {
     cat("\n\n### ", objetivo, " vs. demás variables — ", estacion_sel, "\n\n", sep = "")
 
-    cat("**Estadística descriptiva:**\n\n")
-    print(kable(resumen_descriptivo(datos, estacion_sel, objetivo)))
-
-    cat("\n\n**Correlación de Pearson (ordenada por fuerza):**\n\n")
     tabla_cor <- analizar_correlacion(datos, estacion_sel, objetivo)
-    print(kable(tabla_cor))
-
     top_vars  <- head(tabla_cor$variable, N_TOP)
     rest_vars <- setdiff(tabla_cor$variable, top_vars)
 
@@ -575,3 +627,1281 @@ graficar_serie_continua2(base_analisis, "NTE2", "O3")
 graficar_serie_continua2(base_analisis, "NTE2", "PM10")
 graficar_serie_continua2(base_analisis, "NTE2", "PM2.5")
 ```
+
+función para el análisis factorial por estación
+```{r}
+#| label: fn-factorial
+analizar_factorial <- function(datos, estacion_sel, n_factores = NULL) {
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(numeric_vars)) %>%
+    drop_na()
+
+  # Si no se especifica, sugiere el número de factores con la regla de
+  # Kaiser (eigenvalores > 1) sobre la matriz de correlación
+  if (is.null(n_factores)) {
+    ev <- eigen(cor(df))$values
+    n_factores <- max(1, sum(ev > 1))
+  }
+
+  fa_res <- psych::fa(df, nfactors = n_factores, rotate = "varimax", fm = "ml")
+
+  list(
+    fa         = fa_res,
+    n          = nrow(df),
+    n_total    = sum(datos$estacion == estacion_sel),
+    n_factores = n_factores
+  )
+}
+
+# Tabla de cargas factoriales, lista para imprimir con kable()
+tabla_cargas_factorial <- function(fa_result) {
+  as.data.frame(unclass(fa_result$fa$loadings)) %>%
+    tibble::rownames_to_column("variable") %>%
+    mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+    # ordena para que O3, PM10, PM2.5 salgan primero y sean fáciles de ubicar
+    arrange(desc(variable %in% TARGETS), variable)
+}
+```
+
+Probando modelos...
+
+regresión lineal con los factores del análisis no funciona
+
+funcion para predecir las variables objetivo por medio de las demás variables y variables cíclicas de hora y mes
+
+```{r}
+#| label: fn-modelo-factorial
+agregar_variables_ciclicas <- function(df) {
+  df %>%
+    mutate(
+      hora     = lubridate::hour(date),
+      mes_num  = lubridate::month(date),
+      hora_sin = sin(2 * pi * hora / 24),
+      hora_cos = cos(2 * pi * hora / 24),
+      mes_sin  = sin(2 * pi * mes_num / 12),
+      mes_cos  = cos(2 * pi * mes_num / 12)
+    )
+}
+
+modelar_prediccion_factorial <- function(datos, estacion_sel, objetivo, n_factores = NULL) {
+  vars_pred <- setdiff(numeric_vars, objetivo)  # excluye el objetivo: evita fuga de datos
+
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    drop_na() %>%
+    agregar_variables_ciclicas()
+
+  if (is.null(n_factores)) {
+    ev <- eigen(cor(df[, vars_pred]))$values
+    n_factores <- max(1, sum(ev > 1))
+  }
+
+  fa_res <- psych::fa(df[, vars_pred], nfactors = n_factores, rotate = "quartimax",
+                       fm = "minres", scores = "regression")
+
+  scores_df <- as.data.frame(fa_res$scores)
+  names(scores_df) <- paste0("Factor", seq_len(ncol(scores_df)))
+
+  modelo_df <- bind_cols(
+    scores_df,
+    df %>% select(hora_sin, hora_cos, mes_sin, mes_cos),
+    stats::setNames(list(df[[objetivo]]), objetivo)
+  )
+
+  formula_modelo <- as.formula(paste(objetivo, "~ ."))
+  modelo <- lm(formula_modelo, data = modelo_df)
+
+  list(
+    fa         = fa_res,
+    modelo     = modelo,
+    n          = nrow(df),
+    n_total    = sum(datos$estacion == estacion_sel),
+    n_factores = n_factores,
+    vars_pred  = vars_pred
+  )
+}
+
+reportar_modelo_factorial <- function(res, objetivo, estacion_sel) {
+  modelo <- res$modelo
+  
+  cat(sprintf("\n\n## Modelo factorial para %s — Estación %s\n", objetivo, estacion_sel))
+  cat(sprintf("Observaciones usadas: %d de %d totales\n", res$n, res$n_total))
+  cat(sprintf("Número de factores: %d\n", res$n_factores))
+  cat(sprintf("Variables predictoras originales: %s\n\n", paste(res$vars_pred, collapse = ", ")))
+  
+  # Resumen del modelo
+  print(summary(modelo))
+  
+  # VIF
+  cat("\n\n**VIF (Factores + Cíclicas):**\n\n")
+  vif_vals <- car::vif(modelo)
+  print(kable(tibble(
+    variable = names(vif_vals),
+    VIF = round(vif_vals, 2)
+  )))
+  
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: modelo-SO
+#| warning: false
+#| results: asis
+for (obj in TARGETS) {
+  res <- modelar_prediccion_factorial(base_analisis, "SO", obj)
+  reportar_modelo_factorial(res, obj, "SO")
+}
+```
+
+probemos con las variables originales otra vez pero con el modelo cíclico, quitamos la variable NOX porque infla la varianza haciendo redundancia con las viariables NO y NO2.
+
+```{r}
+#| label: fn-modelo-original
+modelar_prediccion_original <- function(datos, estacion_sel, objetivo) {
+  vars_pred <- setdiff(numeric_vars, c(objetivo, "NOX"))  # excluye objetivo + NOX (redundante con NO+NO2)
+
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    drop_na() %>%
+    agregar_variables_ciclicas()
+
+  modelo_df <- df %>%
+    select(all_of(vars_pred), hora_sin, hora_cos, mes_sin, mes_cos, all_of(objetivo))
+
+  formula_modelo <- as.formula(paste(objetivo, "~ ."))
+  modelo <- lm(formula_modelo, data = modelo_df)
+
+  list(
+    modelo    = modelo,
+    n         = nrow(df),
+    n_total   = sum(datos$estacion == estacion_sel),
+    vars_pred = vars_pred
+  )
+}
+
+reportar_modelo_original <- function(res, objetivo, estacion_sel) {
+  modelo <- res$modelo
+  
+  cat(sprintf("\n\n## Modelo para %s — Estación %s\n", objetivo, estacion_sel))
+  cat(sprintf("Observaciones usadas: %d de %d totales\n", res$n, res$n_total))
+  cat(sprintf("Variables predictoras: %s\n\n", paste(res$vars_pred, collapse = ", ")))
+  
+  # Resumen del modelo
+  print(summary(modelo))
+  
+  cat("\n\n")
+}
+```
+
+funcion para VIF (Variance inlfation factor) para detectar las variables redundantes, que tienen mucha colinealidad o dependencia
+```{r}
+#| label: fn-vif
+evaluar_vif <- function(res) {
+  vif_vals <- car::vif(res$modelo)
+  tibble(variable = names(vif_vals), VIF = round(vif_vals, 2)) %>%
+    arrange(desc(VIF))
+}
+```
+
+Funcion de diagnostico de residuos para evaluar homocedasticidad y normalidad
+```{r}
+#| label: fn-diagnostico-residuos
+
+diagnosticar_residuos <- function(res, objetivo, estacion_sel) {
+  modelo <- res$modelo
+  residuos <- residuals(modelo)
+
+  cat(sprintf("\n\n**Diagnóstico de residuos — %s (%s)**\n\n", objetivo, estacion_sel))
+
+  # Las 4 gráficas clásicas de diagnóstico, una por una (sin cuadrícula)
+  # which: 1 = Residuos vs Ajustados | 2 = QQ-plot | 3 = Escala-Ubicación | 4 = Residuos vs Leverage
+  titulos <- c("Residuos vs. Valores ajustados", "QQ-plot (normalidad)",
+               "Escala-Ubicación (homocedasticidad)", "Residuos vs. Leverage (valores influyentes)")
+  cuales  <- c(1, 2, 3, 4)
+
+  for (i in seq_along(cuales)) {
+    cat(sprintf("\n\n*%s — %s (%s)*\n\n", titulos[i], objetivo, estacion_sel))
+    plot(modelo, which = cuales[i])
+  }
+
+  # --- Pruebas estadísticas ---
+  if (length(residuos) <= 5000) {
+    test_normalidad <- shapiro.test(residuos)
+    nombre_test <- "Shapiro-Wilk"
+  } else {
+    test_normalidad <- nortest::ad.test(residuos)
+    nombre_test <- "Anderson-Darling"
+  }
+
+  # Kolmogorov-Smirnov con corrección de Lilliefors
+  test_lilliefors <- nortest::lillie.test(residuos)
+  cat(sprintf("\n**Lilliefors (Kolmogorov-Smirnov corregido):** D = %.3f, p-value = %.3e\n", test_lilliefors$statistic, test_lilliefors$p.value))
+  interpretacion_lillie <- ifelse(test_lilliefors$p.value < 0.05, "Residuos NO normales", "Residuos normales")
+  cat(sprintf("→ %s\n", interpretacion_lillie))
+  
+  test_homocedasticidad <- lmtest::bptest(modelo)
+  test_autocorrelacion <- lmtest::dwtest(modelo)
+
+  tabla_diagnostico <- tibble(
+  prueba      = c(paste("Normalidad -", nombre_test), 
+                  "Normalidad - Lilliefors (K-S corregido)",
+                  "Homocedasticidad (Breusch-Pagan)", 
+                  "Autocorrelación (Durbin-Watson)"),
+  estadistico = c(round(unname(test_normalidad$statistic), 3),
+                  round(unname(test_lilliefors$statistic), 3),
+                  round(unname(test_homocedasticidad$statistic), 3),
+                  round(unname(test_autocorrelacion$statistic), 3)),
+  p_value     = c(signif(test_normalidad$p.value, 3),
+                  signif(test_lilliefors$p.value, 3),
+                  signif(test_homocedasticidad$p.value, 3),
+                  signif(test_autocorrelacion$p.value, 3)),
+  interpretacion = c(
+    ifelse(test_normalidad$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+    ifelse(test_lilliefors$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+    ifelse(test_homocedasticidad$p.value < 0.05, "Varianza NO constante (heterocedasticidad)", "Varianza constante"),
+    ifelse(test_autocorrelacion$p.value < 0.05, "Residuos autocorrelacionados (esperado en datos horarios)", "Sin autocorrelación")
+  )
+)
+
+  print(kable(tabla_diagnostico))
+  cat("\n\n")
+}
+```
+
+Eliminar los outlier con distancia cook mayor a 0.5
+```{r}
+#| label: eliminar-imprimir-outliers
+
+procesar_outliers <- function(datos, estaciones, targets, umbral_cook = 0.5) {
+  
+  resultados_limpios <- list()
+  
+  cat("\n\n#  PROCESAMIENTO DE OUTLIERS (Cook's Distance >", umbral_cook, ")\n\n")
+  
+  for (estacion in estaciones) {
+    for (obj in targets) {
+      
+      res <- modelar_prediccion_original(datos, estacion, obj)
+      modelo <- res$modelo
+      
+      dist_cook <- cooks.distance(modelo)
+      filas_outliers <- which(dist_cook > umbral_cook)
+      
+      # --- Guardar resultado ---
+      nombre <- paste0(estacion, "_", obj)
+      
+      if (length(filas_outliers) == 0) {
+        
+        # Sin outliers
+        resultados_limpios[[nombre]] <- list(
+          n_eliminados = 0,
+          tabla_outliers = NULL,
+          res_original = res
+        )
+        
+      } else {
+        
+        # --- Crear tabla de outliers ---
+        df_modelo <- modelo$model
+        tabla_outliers <- df_modelo[filas_outliers, ] %>%
+          mutate(
+            cooks_distance = round(dist_cook[filas_outliers], 4),
+            .before = 1
+          )
+        
+        # --- Reentrenar sin outliers ---
+        df_sin_outliers <- df_modelo[-filas_outliers, ]
+        modelo_limpio <- lm(formula(modelo), data = df_sin_outliers)
+        
+        # Actualizar resultado
+        res$modelo <- modelo_limpio
+        res$n <- nrow(df_sin_outliers)
+        
+        resultados_limpios[[nombre]] <- list(
+          n_eliminados = length(filas_outliers),
+          tabla_outliers = tabla_outliers,
+          res_original = res
+        )
+      }
+    }
+  }
+  
+  cat("\n\n##  TABLAS DE OUTLIERS ELIMINADOS\n\n")
+  
+  for (nombre in names(resultados_limpios)) {
+    
+    resultado <- resultados_limpios[[nombre]]
+    
+    if (resultado$n_eliminados > 0) {
+      
+      estacion <- strsplit(nombre, "_")[[1]][1]
+      objetivo <- strsplit(nombre, "_")[[1]][2]
+      
+      cat(sprintf("\n\n### %s - Estación %s\n", objetivo, estacion))
+      cat(sprintf("**Outliers eliminados:** %d\n\n", resultado$n_eliminados))
+      
+      print(kable(resultado$tabla_outliers, format = "markdown", digits = 3))
+      
+      # Resumen Cook's Distance
+      cat(sprintf("\n\n**Resumen Cook's Distance de outliers:**\n"))
+      cat(sprintf("- Mín: %.4f\n", min(resultado$tabla_outliers$cooks_distance)))
+      cat(sprintf("- Máx: %.4f\n", max(resultado$tabla_outliers$cooks_distance)))
+      cat(sprintf("- Media: %.4f\n\n", mean(resultado$tabla_outliers$cooks_distance)))
+      
+      cat("\n---\n")
+      
+    } else {
+      
+      estacion <- strsplit(nombre, "_")[[1]][1]
+      objetivo <- strsplit(nombre, "_")[[1]][2]
+      cat(sprintf("\n\n###  %s - Estación %s\n", objetivo, estacion))
+      cat("No se detectaron outliers con Cook's Distance >", umbral_cook, "\n\n")
+      cat("\n---\n")
+    }
+  }
+  
+  # --- 7. Devolver resultados ---
+  return(resultados_limpios)
+}
+```
+
+```{r}
+#| label: ejecutar-procesamiento-outliers
+#| warning: false
+#| message: false
+
+resultados_limpios <- procesar_outliers(
+  datos = base_analisis,
+  estaciones = c("SO", "SE3", "NTE2"),
+  targets = TARGETS,
+  umbral_cook = 0.5
+)
+```
+
+```{r}
+#| label: modelo-SO
+#| warning: false
+#| results: asis
+for (obj in TARGETS) {
+  res <- modelar_prediccion_original(base_analisis, "SO", obj)
+  reportar_modelo_original(res, obj, "SO")
+  diagnosticar_residuos(res, obj, "SO")
+}
+```
+
+```{r}
+#| label: modelos-limpios-SO
+#| results: asis
+
+cat("\n\n# MODELOS REENTRENADOS SIN OUTLIERS - ESTACIÓN SO\n\n")
+
+for (obj in TARGETS) {
+  
+  nombre <- paste0("SO_", obj)
+  resultado <- resultados_limpios[[nombre]]
+  res <- resultado$res_original
+  
+  cat(sprintf("\n\n## Modelo: %s (SO)\n", obj))
+  cat(sprintf("Observaciones: %d\n\n", res$n))
+  
+  if (resultado$n_eliminados > 0) {
+    cat(sprintf("*(%d outliers eliminados)*\n\n", resultado$n_eliminados))
+  }
+  
+  # Resumen del modelo
+  print(summary(res$modelo))
+  
+  # Diagnóstico de residuos
+  diagnosticar_residuos(res, obj, "SO")
+  
+  cat("\n\n---\n")
+}
+```
+
+
+```{r}
+#| label: modelo-SE3
+#| warning: false
+#| results: asis
+for (obj in TARGETS) {
+  res <- modelar_prediccion_original(base_analisis, "SE3", obj)
+  reportar_modelo_original(res, obj, "SE3")
+  diagnosticar_residuos(res, obj, "SE3")
+}
+```
+
+```{r}
+#| label: modelos-limpios-SE3
+#| results: asis
+
+cat("\n\n#  MODELOS REENTRENADOS SIN OUTLIERS - ESTACIÓN SE3\n\n")
+
+for (obj in TARGETS) {
+  nombre <- paste0("SE3_", obj)
+  resultado <- resultados_limpios[[nombre]]
+  res <- resultado$res_original
+  
+  cat(sprintf("\n\n## Modelo: %s (SE3)\n", obj))
+  cat(sprintf("Observaciones: %d\n\n", res$n))
+  
+  if (resultado$n_eliminados > 0) {
+    cat(sprintf("*(%d outliers eliminados)*\n\n", resultado$n_eliminados))
+  }
+  
+  print(summary(res$modelo))
+  diagnosticar_residuos(res, obj, "SE3")
+  cat("\n\n---\n")
+}
+```
+
+
+```{r}
+#| label: modelo-NTE2
+#| warning: false
+#| results: asis
+for (obj in TARGETS) {
+  res <- modelar_prediccion_original(base_analisis, "NTE2", obj)
+  reportar_modelo_original(res, obj, "NTE2")
+  diagnosticar_residuos(res, obj, "NTE2")
+}
+```
+
+```{r}
+#| label: modelos-limpios-NTE2
+#| results: asis
+
+cat("\n\n#  MODELOS REENTRENADOS SIN OUTLIERS - ESTACIÓN NTE2\n\n")
+
+for (obj in TARGETS) {
+  nombre <- paste0("NTE2_", obj)
+  resultado <- resultados_limpios[[nombre]]
+  res <- resultado$res_original
+  
+  cat(sprintf("\n\n## Modelo: %s (NTE2)\n", obj))
+  cat(sprintf("Observaciones: %d\n\n", res$n))
+  
+  if (resultado$n_eliminados > 0) {
+    cat(sprintf("*(%d outliers eliminados)*\n\n", resultado$n_eliminados))
+  }
+  
+  print(summary(res$modelo))
+  diagnosticar_residuos(res, obj, "NTE2")
+  cat("\n\n---\n")
+}
+```
+
+Se decide por el modelo original, no hay mejora significativa sin los outliers >0.5 (3 a 0.77) y >0.4 ya estaríamos eliminando datos que pueden estar bien
+
+LLegamos al límite de un modelo de regresión lineal, agregaremos las relaciones cuadráticas de las variables en el día con las variables objetivo:
+- variación de la temperatura en horas
+- saturación de la radiación solar
+- la acumulación de las variables por las condiciones climáticas
+- variables rezagadas con relevancia para predecir la cantidad de las siguientes horas
+
+- TOUT
+O3:    Relación en U invertida (máximo ~25-30°C)
+PM10:  Relación LINEAL inversa (más calor = más dispersión = menos partículas)
+PM2.5: Relación LINEAL inversa (más calor = más dispersión)
+
+- RH
+O3:    Relación inversa (más humedad = menos O3 porque compite con el agua)
+PM10:  Relación POSITIVA (partículas absorben agua -> crecen -> más PM10)
+PM2.5: Relación POSITIVA (partículas absorben agua -> crecen -> más PM2.5)
+
+- SR
+O3:    Relación LOGARÍTMICA (más luz = más O3, pero se satura)
+PM10:  Relación inversa (más luz = más convección = dispersión)
+PM2.5: Relación inversa (más luz = más convección = dispersión)
+
+- WSR
+O3:    Relación inversa (más viento = dispersión = menos O3)
+PM10:  Relación FUERTEMENTE inversa (el viento limpia partículas)
+PM2.5: Relación FUERTEMENTE inversa (el viento limpia partículas)
+
+- PRS
+Todos: Relación inversa (más presión = estabilidad = acumulación)
+
+- Rezagos
+O3:    Rezago de 1-3 horas (reacciones fotoquímicas)
+PM10:  Rezago de 6-24 horas (acumulación/deposición)
+PM2.5: Rezago de 6-24 horas (acumulación/deposición)
+
+- Acumulación
+O3:    Promedio de 3-6 horas (tiempo de reacción)
+PM10:  Promedio de 12-24 horas (persistencia en aire)
+PM2.5: Promedio de 12-24 horas (persistencia en aire)
+
+
+```{r}
+modelar_prediccion_original <- function(datos, estacion_sel, objetivo) {
+  
+  # --- 1. Variables base ---
+  vars_base <- c("NO", "NO2", "CO", "SO2", "TOUT", "RH", "WSR", "WDR", "PRS", "RAINF", "SR")
+  
+  # --- 2. Variables específicas por objetivo ---
+  if (objetivo == "O3") {
+    vars_extra <- c("PM10", "PM2.5")
+    vars_poly <- c("TOUT2", "log_SR")
+    vars_acum <- "RH_6h"
+    vars_lag <- c("O3_lag1", "O3_lag2")
+    
+  } else if (objetivo == "PM10") {
+    vars_extra <- c("PM2.5", "NO", "NO2", "CO")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    vars_lag <- c("PM10_lag1", "PM10_lag3")
+    
+  } else if (objetivo == "PM2.5") {
+    vars_extra <- c("PM10", "NO2", "CO")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    vars_lag <- c("PM2.5_lag1", "PM2.5_lag3")
+  }
+  
+  vars_pred <- unique(c(vars_base, vars_extra))
+  
+  # --- 3. Preparar datos ---
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    arrange(date) %>%
+    mutate(across(-date, ~ ifelse(.x < 0, NA, .x))) %>%
+    mutate(across(-date, ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    })) %>%
+    agregar_variables_ciclicas()
+  
+  # --- 4. Crear SOLO las variables que corresponden ---
+  
+  # Inicializar df con las variables base
+  df_final <- df
+  
+  # Polinómicas (solo si corresponde)
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        TOUT2 = TOUT^2,
+        log_SR = log(SR + 1)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        log_WSR = log(WSR + 0.1)
+      )
+  }
+  
+  # Acumulaciones (solo si corresponde)
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        RH_6h = zoo::rollapply(RH, width = 6, FUN = mean, fill = NA, 
+                               align = "right", partial = TRUE)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        RH_12h = zoo::rollapply(RH, width = 12, FUN = mean, fill = NA, 
+                                align = "right", partial = TRUE)
+      )
+  }
+  
+  # Rezagos (solo si corresponde)
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        O3_lag1 = dplyr::lag(O3, 1),
+        O3_lag2 = dplyr::lag(O3, 2)
+      )
+  } else if (objetivo == "PM10") {
+    df_final <- df_final %>%
+      mutate(
+        PM10_lag1 = dplyr::lag(PM10, 1),
+        PM10_lag3 = dplyr::lag(PM10, 3)
+      )
+  } else if (objetivo == "PM2.5") {
+    df_final <- df_final %>%
+      mutate(
+        PM2.5_lag1 = dplyr::lag(PM2.5, 1),
+        PM2.5_lag3 = dplyr::lag(PM2.5, 3)
+      )
+  }
+  
+  # --- 5. Imputar NA en rezagos y acumulaciones ---
+  df_final <- df_final %>%
+    mutate(across(where(is.numeric), ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    }))
+  
+  # --- 6. Variables finales ---
+  vars_final <- c(vars_pred, vars_poly, vars_acum, vars_lag,
+                  "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+  
+  # Solo mantener las variables que existen en df_final
+  vars_existentes <- intersect(vars_final, names(df_final))
+  
+  modelo_df <- df_final %>%
+    select(all_of(vars_existentes), all_of(objetivo))
+  
+  # --- 7. ELIMINAR VARIABLES CON VARIANZA CERO ---
+  vars_predictoras <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras) > 0) {
+    varianzas <- sapply(modelo_df[, vars_predictoras], function(x) var(x, na.rm = TRUE))
+    vars_eliminar <- names(varianzas[varianzas == 0 | is.na(varianzas)])
+    
+    if (length(vars_eliminar) > 0) {
+      cat(sprintf("\nEliminando variables con varianza cero: %s\n", 
+                  paste(vars_eliminar, collapse = ", ")))
+      modelo_df <- modelo_df %>% select(-all_of(vars_eliminar))
+    }
+  }
+  
+  # --- 8. Verificar que hay variables predictoras ---
+  vars_predictoras_final <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras_final) == 0) {
+    cat("No hay variables predictoras disponibles\n")
+    return(NULL)
+  }
+  
+  # --- 9. MODELO ---
+  modelo <- lm(as.formula(paste(objetivo, "~ .")), 
+               data = modelo_df, 
+               na.action = na.omit)
+  
+  if (nrow(modelo$model) == 0) {
+    cat("No hay datos completos después de na.omit\n")
+    return(NULL)
+  }
+  
+  cat(sprintf("\nModelo creado: %d filas usadas, %d variables\n", 
+              nrow(modelo$model), length(coef(modelo)) - 1))
+  
+  list(
+    modelo = modelo,
+    n = nrow(modelo$model),
+    n_total = sum(datos$estacion == estacion_sel),
+    vars_pred = names(modelo$model)[names(modelo$model) != objetivo]
+  )
+}
+```
+
+
+```{r}
+#| label: modelo-imputado-SO
+#| warning: false
+#| message: false
+#| results: asis
+
+cat("\n\n# MODELO CON IMPUTACIÓN - ESTACIÓN SO\n\n")
+
+modelos_SO <- list()
+
+for (obj in TARGETS) {
+  cat(sprintf("\n\n## Modelo: %s (SO)\n", obj))
+  
+  # Correr modelo con imputación
+  res <- modelar_prediccion_original(base_analisis, "SO", obj)
+  modelos_SO[[obj]] <- res
+  
+  # Verificar que el modelo se creó correctamente
+  if (is.null(res)) {
+    cat("No se pudo crear el modelo. Revisar datos.\n")
+    next
+  }
+  
+  # Resumen del modelo
+  print(summary(res$modelo))
+  
+  # Reporte de imputación
+  cat(sprintf("\n\n**Reporte de datos:**\n"))
+  cat(sprintf("- Filas totales en estación: %d\n", res$n_total))
+  cat(sprintf("- Filas usadas en modelo: %d\n", res$n))
+  cat(sprintf("- Filas eliminadas (NA): %d\n", res$n_total - res$n))
+  cat(sprintf("- Porcentaje de datos perdidos: %.2f%%\n", 
+              (res$n_total - res$n) / res$n_total * 100))
+  
+  # VIF
+  cat("\n\n**VIF:**\n\n")
+  vif_vals <- evaluar_vif(res)
+  print(kable(vif_vals, format = "markdown"))
+  
+  cat("\n\n---\n")
+}
+```
+
+Demasiada colinealidad (redundancia), nos quedaremos con las variables no lineales y eliminaremos las lineales que tengan VIF altos. O3 sin TOUT y SR, PM10 y PM2.5 sin WSR, y las 3 sin RH.
+
+```{r}
+#| label: fn-modelo-original-modificado
+
+modelar_prediccion_original <- function(datos, estacion_sel, objetivo) {
+  
+  # --- 1. Variables base (comunes a TODOS) ---
+  vars_base <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                 "PM10", "PM2.5")
+  
+  # --- 2. Variables específicas por objetivo ---
+  if (objetivo == "O3") {
+    # O3: NO incluir TOUT, SR, RH (usamos versiones no lineales)
+    vars_extra <- c("WSR", "TOUT", "SR", "RH")  # Necesitamos las originales para crear las transformaciones
+    
+  } else if (objetivo == "PM10") {
+    # PM10: NO incluir WSR, RH (usamos versiones no lineales)
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")  # Necesitamos las originales para crear las transformaciones
+    
+  } else if (objetivo == "PM2.5") {
+    # PM2.5: NO incluir WSR, RH (usamos versiones no lineales)
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")  # Necesitamos las originales para crear las transformaciones
+  }
+  
+  # --- 3. Unir variables (SOLO las que existen en los datos originales) ---
+  vars_pred <- unique(c(vars_base, vars_extra))
+  
+  # --- 4. Preparar datos (SOLO variables originales + date) ---
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    arrange(date) %>%
+    # Convertir valores negativos a NA
+    mutate(across(-date, ~ ifelse(.x < 0, NA, .x))) %>%
+    # Imputar NA con la media (primera capa)
+    mutate(across(-date, ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    }))
+  
+  # --- 5. Agregar variables cíclicas ---
+  df <- df %>%
+    agregar_variables_ciclicas()
+  
+  # --- 6. Agregar transformaciones NO lineales ---
+  df <- df %>%
+    mutate(
+      # Polinómicas (solo si existe la variable base)
+      TOUT2 = if (objetivo == "O3" && "TOUT" %in% names(df)) TOUT^2 else NA_real_,
+      log_SR = if (objetivo == "O3" && "SR" %in% names(df)) log(SR + 1) else NA_real_,
+      log_WSR = if (objetivo %in% c("PM10", "PM2.5") && "WSR" %in% names(df)) log(WSR + 0.1) else NA_real_,
+      
+      # Acumulaciones de humedad
+      RH_6h = if (objetivo == "O3" && "RH" %in% names(df)) {
+        zoo::rollapply(RH, width = 6, FUN = mean, fill = NA, 
+                       align = "right", partial = TRUE)
+      } else NA_real_,
+      
+      RH_12h = if (objetivo %in% c("PM10", "PM2.5") && "RH" %in% names(df)) {
+        zoo::rollapply(RH, width = 12, FUN = mean, fill = NA, 
+                       align = "right", partial = TRUE)
+      } else NA_real_,
+      
+      # Rezagos del objetivo
+      O3_lag1 = if (objetivo == "O3") dplyr::lag(O3, 1) else NA_real_,
+      O3_lag2 = if (objetivo == "O3") dplyr::lag(O3, 2) else NA_real_,
+      PM10_lag1 = if (objetivo == "PM10") dplyr::lag(PM10, 1) else NA_real_,
+      PM10_lag3 = if (objetivo == "PM10") dplyr::lag(PM10, 3) else NA_real_,
+      PM2.5_lag1 = if (objetivo == "PM2.5") dplyr::lag(PM2.5, 1) else NA_real_,
+      PM2.5_lag3 = if (objetivo == "PM2.5") dplyr::lag(PM2.5, 3) else NA_real_
+    )
+  
+  # --- 7. Imputar NA en rezagos y acumulaciones ---
+  df <- df %>%
+    mutate(across(c(O3_lag1, O3_lag2, PM10_lag1, PM10_lag3, 
+                    PM2.5_lag1, PM2.5_lag3, RH_6h, RH_12h, 
+                    TOUT2, log_SR, log_WSR),
+                  ~ ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x)))
+  
+  # --- 8. Definir variables FINALES para el modelo (las que realmente queremos) ---
+  if (objetivo == "O3") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "WSR",
+                     "TOUT2", "log_SR", "RH_6h",
+                     "O3_lag1", "O3_lag2",
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM10") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "TOUT", "SR",
+                     "log_WSR", "RH_12h",
+                     "PM10_lag1", "PM10_lag3",
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM2.5") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "TOUT", "SR",
+                     "log_WSR", "RH_12h",
+                     "PM2.5_lag1", "PM2.5_lag3",
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+  }
+  
+  # Solo mantener las variables que existen en df
+  vars_existentes <- intersect(vars_modelo, names(df))
+  
+  modelo_df <- df %>%
+    select(all_of(vars_existentes), all_of(objetivo))
+  
+  # --- 9. Eliminar variables con varianza cero ---
+  vars_predictoras <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras) > 0) {
+    varianzas <- sapply(modelo_df[, vars_predictoras], function(x) var(x, na.rm = TRUE))
+    vars_eliminar <- names(varianzas[varianzas == 0 | is.na(varianzas)])
+    
+    if (length(vars_eliminar) > 0) {
+      cat(sprintf("\nEliminando variables con varianza cero: %s\n", 
+                  paste(vars_eliminar, collapse = ", ")))
+      modelo_df <- modelo_df %>% select(-all_of(vars_eliminar))
+    }
+  }
+  
+  # --- 10. Verificar que hay variables predictoras ---
+  vars_predictoras_final <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras_final) == 0) {
+    cat("No hay variables predictoras disponibles\n")
+    return(NULL)
+  }
+  
+  # --- 11. MODELO ---
+  modelo <- lm(as.formula(paste(objetivo, "~ .")), 
+               data = modelo_df, 
+               na.action = na.omit)
+  
+  if (nrow(modelo$model) == 0) {
+    cat("No hay datos completos después de na.omit\n")
+    return(NULL)
+  }
+  
+  cat(sprintf("\nModelo creado: %d filas usadas, %d variables\n", 
+              nrow(modelo$model), length(coef(modelo)) - 1))
+  
+  list(
+    modelo = modelo,
+    n = nrow(modelo$model),
+    n_total = sum(datos$estacion == estacion_sel),
+    vars_pred = names(modelo$model)[names(modelo$model) != objetivo]
+  )
+}
+```
+
+```{r}
+#| label: modelo-modificado-SO
+#| warning: false
+#| message: false
+#| results: asis
+
+cat("\n\n#MODELO MODIFICADO - ESTACIÓN SO\n\n")
+
+modelos_SO <- list()
+
+for (obj in TARGETS) {
+  cat(sprintf("\n\n## Modelo: %s (SO)\n", obj))
+  
+  res <- modelar_prediccion_original(base_analisis, "SO", obj)
+  modelos_SO[[obj]] <- res
+  
+  if (is.null(res)) {
+    cat("No se pudo crear el modelo.\n")
+    next
+  }
+  
+  print(summary(res$modelo))
+  
+  cat("\n\n**VIF:**\n\n")
+  vif_vals <- evaluar_vif(res)
+  print(kable(vif_vals, format = "markdown"))
+  
+  cat("\n\n---\n")
+}
+```
+
+```{r}
+#| label: modelo-modificado-SE3
+#| warning: false
+#| message: false
+#| results: asis
+
+cat("\n\n#MODELO MODIFICADO - ESTACIÓN SE3\n\n")
+
+modelos_SE3 <- list()
+
+for (obj in TARGETS) {
+  cat(sprintf("\n\n## Modelo: %s (SE3)\n", obj))
+  
+  res <- modelar_prediccion_original(base_analisis, "SE3", obj)
+  modelos_SE3[[obj]] <- res
+  
+  if (is.null(res)) {
+    cat("No se pudo crear el modelo.\n")
+    next
+  }
+  
+  print(summary(res$modelo))
+  
+  cat("\n\n**VIF:**\n\n")
+  vif_vals <- evaluar_vif(res)
+  print(kable(vif_vals, format = "markdown"))
+  
+  cat("\n\n---\n")
+}
+```
+
+```{r}
+#| label: modelo-modificado-NTE2
+#| warning: false
+#| message: false
+#| results: asis
+
+cat("\n\n#MODELO MODIFICADO - ESTACIÓN NTE2\n\n")
+
+modelos_NTE2 <- list()
+
+for (obj in TARGETS) {
+  cat(sprintf("\n\n## Modelo: %s (NTE2)\n", obj))
+  
+  res <- modelar_prediccion_original(base_analisis, "NTE2", obj)
+  modelos_NTE2[[obj]] <- res
+  
+  if (is.null(res)) {
+    cat("No se pudo crear el modelo.\n")
+    next
+  }
+  
+  print(summary(res$modelo))
+  
+  cat("\n\n**VIF:**\n\n")
+  vif_vals <- evaluar_vif(res)
+  print(kable(vif_vals, format = "markdown"))
+  
+  cat("\n\n---\n")
+}
+```
+
+
+
+Evaluación del modelo final
+
+```{r}
+#| label: fn-evaluar-modelo-final
+
+evaluar_modelo_final <- function(res, objetivo, estacion_sel) {
+  
+  modelo <- res$modelo
+  df_modelo <- modelo$model
+  residuos <- residuals(modelo)
+  ajustados <- fitted(modelo)
+  
+  cat(paste0("\n\n", paste(rep("=", 80), collapse = "")))
+  cat(paste0("\nEVALUACION COMPLETA DEL MODELO — ", objetivo, " (", estacion_sel, ")"))
+  cat(paste0("\n", paste(rep("=", 80), collapse = "")))
+  
+  # --- 1. RESULTADOS GLOBALES ---
+  cat("\n\nRESUMEN GLOBAL:\n")
+  cat(paste0("   - Filas usadas: ", res$n, "\n"))
+  cat(paste0("   - Variables predictoras: ", length(coef(modelo)) - 1, "\n"))
+  cat(paste0("   - R²: ", round(summary(modelo)$r.squared, 4), "\n"))
+  cat(paste0("   - R² ajustado: ", round(summary(modelo)$adj.r.squared, 4), "\n"))
+  cat(paste0("   - F-statistic: ", round(summary(modelo)$fstatistic[1], 2), 
+             " (p-value: ", format(pf(summary(modelo)$fstatistic[1], 
+                                      summary(modelo)$fstatistic[2], 
+                                      summary(modelo)$fstatistic[3], 
+                                      lower.tail = FALSE), scientific = TRUE, digits = 2), ")\n"))
+  
+  # --- 2. RESIDUOS (estadísticas básicas) ---
+  cat("\n\nESTADISTICAS DE RESIDUOS:\n")
+  cat(paste0("   - Minimo: ", round(min(residuos), 4), "\n"))
+  cat(paste0("   - 1er Cuartil: ", round(quantile(residuos, 0.25), 4), "\n"))
+  cat(paste0("   - Mediana: ", round(median(residuos), 4), "\n"))
+  cat(paste0("   - 3er Cuartil: ", round(quantile(residuos, 0.75), 4), "\n"))
+  cat(paste0("   - Maximo: ", round(max(residuos), 4), "\n"))
+  cat(paste0("   - Desviacion estandar: ", round(sd(residuos), 4), "\n"))
+  cat(paste0("   - Media: ", round(mean(residuos), 4), " (debe ser ~0)\n"))
+  
+  # --- 3. GRAFICOS DE DIAGNOSTICO (por separado) ---
+  cat("\n\nGRAFICOS DE DIAGNOSTICO:\n")
+  
+  # Grafico 1: Residuos vs Ajustados
+  cat("\n\n### 1. Residuos vs Valores Ajustados\n")
+  plot(modelo, which = 1, 
+       main = paste0("Residuos vs Valores Ajustados (", objetivo, " - ", estacion_sel, ")"))
+  
+  # Grafico 2: QQ-plot
+  cat("\n\n### 2. QQ-plot (Normalidad)\n")
+  plot(modelo, which = 2, 
+       main = paste0("QQ-plot (Normalidad) (", objetivo, " - ", estacion_sel, ")"))
+  
+  # Grafico 3: Escala-Ubicacion
+  cat("\n\n### 3. Escala-Ubicacion (Homocedasticidad)\n")
+  plot(modelo, which = 3, 
+       main = paste0("Escala-Ubicacion (Homocedasticidad) (", objetivo, " - ", estacion_sel, ")"))
+  
+  # Grafico 4: Residuos vs Leverage
+  cat("\n\n### 4. Residuos vs Leverage (Valores Influyentes)\n")
+  plot(modelo, which = 4, 
+       main = paste0("Residuos vs Leverage (Valores Influyentes) (", objetivo, " - ", estacion_sel, ")"))
+  
+  # --- 4. PREDICCIONES VS OBSERVADOS ---
+  cat("\n\nPREDICCIONES VS VALORES OBSERVADOS:\n")
+  
+  # Calcular metricas de error
+  mae <- mean(abs(residuos))
+  rmse <- sqrt(mean(residuos^2))
+  mape <- mean(abs(residuos / df_modelo[[objetivo]])) * 100
+  
+  cat(paste0("   - MAE (Error Absoluto Medio): ", round(mae, 4), "\n"))
+  cat(paste0("   - RMSE (Raiz del Error Cuadratico Medio): ", round(rmse, 4), "\n"))
+  cat(paste0("   - MAPE (Error Porcentual Absoluto Medio): ", round(mape, 2), "%\n"))
+  
+  # Grafico: Predicted vs Actual CON LEYENDA
+  plot_pred_vs_actual <- ggplot(df_modelo, aes(x = .data[[objetivo]], y = ajustados)) +
+    geom_point(alpha = 0.3, size = 0.8, color = "gray40") +
+    geom_abline(slope = 1, intercept = 0, color = "firebrick", linewidth = 1, 
+                linetype = "solid") +
+    geom_smooth(method = "lm", se = TRUE, color = "steelblue", alpha = 0.2, 
+                fill = "steelblue") +
+    labs(
+      title = paste0("Predicciones vs Observados — ", objetivo, " (", estacion_sel, ")"),
+      x = paste0("Observado (", objetivo, ")"),
+      y = paste0("Predicho (", objetivo, ")"),
+      subtitle = paste0("R² = ", round(summary(modelo)$r.squared, 4), 
+                        " | MAE = ", round(mae, 2),
+                        " | RMSE = ", round(rmse, 2))
+    ) +
+    theme_minimal() +
+    coord_fixed() +
+    # Agregar leyenda manual
+    annotate("text", x = Inf, y = -Inf, 
+             label = "Linea roja: Perfecta (y = x)\nLinea azul: Regresion lineal", 
+             hjust = 1.1, vjust = -0.5, size = 3.5, color = "black")
+  
+  print(plot_pred_vs_actual)
+  
+  # --- 5. RESIDUOS VS VARIABLES CLAVE (no lineales) ---
+  cat("\n\nRESIDUOS VS VARIABLES NO LINEALES:\n")
+  
+  # Identificar variables no lineales en el modelo
+  vars_nonlinear <- c()
+  if ("TOUT" %in% names(df_modelo) && "TOUT2" %in% names(df_modelo)) {
+    vars_nonlinear <- c(vars_nonlinear, "TOUT")
+  }
+  if ("SR" %in% names(df_modelo) && "log_SR" %in% names(df_modelo)) {
+    vars_nonlinear <- c(vars_nonlinear, "SR")
+  }
+  if ("WSR" %in% names(df_modelo) && "log_WSR" %in% names(df_modelo)) {
+    vars_nonlinear <- c(vars_nonlinear, "WSR")
+  }
+  
+  if (length(vars_nonlinear) > 0) {
+    
+    # Crear data frame para residuos
+    df_residuos <- df_modelo %>%
+      select(all_of(vars_nonlinear)) %>%
+      mutate(residuo = residuos)
+    
+    # Para cada variable no lineal, graficar residuos
+    for (var in vars_nonlinear) {
+      
+      # Extraer la transformacion no lineal asociada
+      transformacion <- switch(var,
+                               "TOUT" = "TOUT2",
+                               "SR" = "log_SR",
+                               "WSR" = "log_WSR")
+      
+      # Verificar que la transformacion existe
+      if (transformacion %in% names(df_modelo)) {
+        
+        p <- ggplot(df_residuos, aes(x = .data[[var]], y = residuo)) +
+          geom_point(alpha = 0.3, size = 0.8, color = "gray40") +
+          geom_hline(yintercept = 0, color = "firebrick", linetype = "dashed", linewidth = 0.7) +
+          geom_smooth(method = "loess", se = TRUE, color = "steelblue", span = 0.5, fill = "steelblue") +
+          labs(
+            title = paste0("Residuos vs ", var, " — ", objetivo, " (", estacion_sel, ")"),
+            subtitle = paste0("Transformacion usada: ", transformacion),
+            x = var,
+            y = "Residuo"
+          ) +
+          theme_minimal()
+        
+        print(p)
+        cat("\n")
+      }
+    }
+  } else {
+    cat("   No se detectaron variables no lineales en el modelo\n")
+  }
+  
+  # --- 6. PRUEBAS ESTADISTICAS ---
+  cat("\n\nPRUEBAS ESTADISTICAS:\n")
+  
+  # Normalidad
+  n_residuos <- length(residuos)
+  if (n_residuos <= 5000) {
+    test_normalidad <- shapiro.test(residuos)
+    nombre_test <- "Shapiro-Wilk"
+  } else {
+    test_normalidad <- nortest::ad.test(residuos)
+    nombre_test <- "Anderson-Darling"
+  }
+  
+  test_lilliefors <- nortest::lillie.test(residuos)
+  test_homocedasticidad <- lmtest::bptest(modelo)
+  test_autocorrelacion <- lmtest::dwtest(modelo)
+  
+  # Crear tabla
+  tabla_diagnostico <- tibble(
+    prueba = c(
+      paste("Normalidad -", nombre_test),
+      "Normalidad - Lilliefors (K-S corregido)",
+      "Homocedasticidad (Breusch-Pagan)",
+      "Autocorrelacion (Durbin-Watson)"
+    ),
+    estadistico = c(
+      round(unname(test_normalidad$statistic), 3),
+      round(unname(test_lilliefors$statistic), 3),
+      round(unname(test_homocedasticidad$statistic), 3),
+      round(unname(test_autocorrelacion$statistic), 3)
+    ),
+    p_value = c(
+      signif(test_normalidad$p.value, 3),
+      signif(test_lilliefors$p.value, 3),
+      signif(test_homocedasticidad$p.value, 3),
+      signif(test_autocorrelacion$p.value, 3)
+    ),
+    interpretacion = c(
+      ifelse(test_normalidad$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+      ifelse(test_lilliefors$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+      ifelse(test_homocedasticidad$p.value < 0.05, "Varianza NO constante (heterocedasticidad)", "Varianza constante"),
+      ifelse(test_autocorrelacion$p.value < 0.05, "Residuos autocorrelacionados (esperado en datos horarios)", "Sin autocorrelacion")
+    )
+  )
+  
+  print(kable(tabla_diagnostico, format = "markdown"))
+  
+  # --- 7. VIF (con advertencia para polinomicas) ---
+  cat("\n\nVIF (Factor de Inflacion de Varianza):\n")
+  cat("   * NOTA: VIF alto en TOUT2/log_SR/log_WSR es NORMAL por ser polinomicas\n\n")
+  
+  vif_vals <- car::vif(modelo)
+  vif_df <- tibble(
+    variable = names(vif_vals),
+    VIF = round(vif_vals, 2)
+  ) %>% arrange(desc(VIF))
+  
+  # Marcar variables polinomicas
+  vif_df <- vif_df %>%
+    mutate(
+      tipo = case_when(
+        variable %in% c("TOUT2", "log_SR", "log_WSR") ~ "Polinomica (VIF alto esperado)",
+        variable %in% c("TOUT", "SR", "WSR") ~ "Lineal (relacionada con polinomica)",
+        TRUE ~ "Normal"
+      )
+    )
+  
+  print(kable(vif_df, format = "markdown"))
+  
+  # --- 8. CONCLUSION ---
+  cat("\n\nCONCLUSIONES:\n")
+  
+  # R²
+  if (summary(modelo)$adj.r.squared > 0.8) {
+    cat("   R² ajustado > 0.8 -> Excelente poder explicativo\n")
+  } else if (summary(modelo)$adj.r.squared > 0.6) {
+    cat("   R² ajustado > 0.6 -> Buen poder explicativo\n")
+  } else {
+    cat("   R² ajustado < 0.6 -> Poder explicativo moderado/bajo\n")
+  }
+  
+  # Normalidad
+  if (test_normalidad$p.value > 0.05) {
+    cat("   Residuos normales -> Intervalos de confianza fiables\n")
+  } else {
+    cat("   Residuos NO normales -> Los p-values pueden no ser exactos\n")
+  }
+  
+  # Homocedasticidad
+  if (test_homocedasticidad$p.value > 0.05) {
+    cat("   Varianza constante -> Errores estandar fiables\n")
+  } else {
+    cat("   Varianza NO constante -> Usar errores estandar robustos\n")
+  }
+  
+  # Autocorrelacion
+  dw_val <- test_autocorrelacion$statistic
+  if (dw_val > 1.5 & dw_val < 2.5) {
+    cat("   Sin autocorrelacion significativa\n")
+  } else if (dw_val < 1.5) {
+    cat("   Autocorrelacion positiva -> Considerar mas rezagos\n")
+  } else {
+    cat("   Autocorrelacion negativa -> Revisar especificacion del modelo\n")
+  }
+  
+  cat(paste0("\n", paste(rep("=", 80), collapse = "")))
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: evaluacion-final-SO
+#| warning: false
+#| message: false
+#| results: asis
+
+cat("\n\n#EVALUACIÓN FINAL - ESTACIÓN SO\n\n")
+
+for (obj in TARGETS) {
+  res <- modelos_SO[[obj]]
+  
+  if (!is.null(res)) {
+    evaluar_modelo_final(res, obj, "SO")
+  } else {
+    cat(sprintf("\nModelo %s (SO) no disponible\n", obj))
+  }
+}
+```
+
+```{r}
+#| label: evaluacion-final-SE3
+#| warning: false
+#| message: false
+#| results: asis
+
+cat("\n\n#EVALUACIÓN FINAL - ESTACIÓN SE3\n\n")
+
+for (obj in TARGETS) {
+  res <- modelos_SE3[[obj]]
+  
+  if (!is.null(res)) {
+    evaluar_modelo_final(res, obj, "SE3")
+  } else {
+    cat(sprintf("\nModelo %s (SE3) no disponible\n", obj))
+  }
+}
+```
+
+```{r}
+#| label: evaluacion-final-NTE2
+#| warning: false
+#| message: false
+#| results: asis
+
+cat("\n\n#EVALUACIÓN FINAL - ESTACIÓN NTE2\n\n")
+
+for (obj in TARGETS) {
+  res <- modelos_NTE2[[obj]]
+  
+  if (!is.null(res)) {
+    evaluar_modelo_final(res, obj, "NTE2")
+  } else {
+    cat(sprintf("\nModelo %s (NTE2) no disponible\n", obj))
+  }
+}
+```
+
