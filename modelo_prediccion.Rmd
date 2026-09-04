@@ -1,0 +1,415 @@
+---
+title: "Modelo de predicción de O3, PM10 y PM2.5"
+subtitle: "Entrenamiento con histórico + predicción sobre datos nuevos"
+author: "David Collins"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(zoo)
+library(knitr)
+library(writexl)
+library(ggplot2)
+```
+
+# 1. Configuración
+
+Ajusta estas rutas y parámetros según tu caso.
+
+```{r configuracion}
+# --- Estaciones y contaminantes objetivo ---
+STATIONS <- c("SO", "SE3", "NTE2")
+TARGETS  <- c("O3", "PM10", "PM2.5")
+
+# --- Archivos históricos para ENTRENAR el modelo ---
+archivos_entrenamiento <- list(
+  "2022" = "~/R_Multivariados/2003B_Blank/data/BD 2022.xlsx",
+  "2023" = "~/R_Multivariados/2003B_Blank/data/BD 2023.xlsx",
+  "2024" = "~/R_Multivariados/2003B_Blank/data/BD 2024.xlsx"
+)
+
+# --- Archivo(s) con datos NUEVOS a predecir ---
+# IMPORTANTE: para que los rezagos (ej. O3_lag1, O3_lag2) se puedan calcular,
+# el archivo de datos nuevos debe incluir también algunas horas previas de
+# "calentamiento" (idealmente al menos 24h antes del periodo que te interesa
+# predecir), no solo las horas objetivo.
+archivo_datos_nuevos <- "~/R_Multivariados/2003B_Blank/data/BD 2025.xlsx"
+
+# --- Dónde guardar/cargar los modelos ya entrenados ---
+ruta_modelos <- "modelos_finales.rds"
+
+# --- Dónde exportar las predicciones resultantes ---
+ruta_salida_predicciones <- "predicciones.xlsx"
+```
+
+# 2. Funciones de carga y limpieza de datos
+
+```{r fn-carga}
+leer_estacion <- function(archivo, hoja, anio) {
+  raw <- read_excel(archivo, sheet = hoja)
+
+  names(raw) <- names(raw) %>%
+    str_remove("\\(.*\\)") %>%
+    str_trim()
+
+  names(raw)[1] <- "date"
+
+  raw %>%
+    mutate(date = as.POSIXct(date, tz = "America/Monterrey")) %>%
+    filter(!is.na(date)) %>%              # descarta la fila de unidades (si existe)
+    mutate(
+      across(-date, as.numeric),
+      estacion = hoja,
+      año = anio
+    ) %>%
+    select(año, estacion, date, everything())
+}
+
+cargar_multiples_anios <- function(archivos_por_anio, estaciones) {
+  map_dfr(names(archivos_por_anio), function(anio) {
+    archivo <- archivos_por_anio[[anio]]
+    map_dfr(estaciones, ~ leer_estacion(archivo, .x, as.numeric(anio)))
+  })
+}
+```
+
+# 3. Ingeniería de variables (compartida entre entrenamiento y predicción)
+
+Estas son las mismas transformaciones no lineales, cíclicas, de acumulación y
+de rezago que se determinaron como el modelo final. Se centralizan aquí en
+una sola función para garantizar que el entrenamiento y la predicción
+apliquen **exactamente los mismos cálculos**.
+
+```{r fn-features}
+agregar_variables_ciclicas <- function(df) {
+  df %>%
+    mutate(
+      hora     = lubridate::hour(date),
+      mes_num  = lubridate::month(date),
+      hora_sin = sin(2 * pi * hora / 24),
+      hora_cos = cos(2 * pi * hora / 24),
+      mes_sin  = sin(2 * pi * mes_num / 12),
+      mes_cos  = cos(2 * pi * mes_num / 12)
+    )
+}
+
+# Variables base y específicas por objetivo (según el modelo final)
+obtener_config_objetivo <- function(objetivo) {
+  vars_base <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", "PM10", "PM2.5")
+
+  if (objetivo == "O3") {
+    list(
+      vars_extra = c("WSR", "TOUT", "SR", "RH"),
+      vars_modelo = c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF",
+                       "PM10", "PM2.5", "WSR",
+                       "TOUT2", "log_SR", "RH_6h",
+                       "O3_lag1", "O3_lag2",
+                       "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    )
+  } else if (objetivo == "PM10") {
+    list(
+      vars_extra = c("TOUT", "SR", "WSR", "RH"),
+      vars_modelo = c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF",
+                       "PM10", "PM2.5", "TOUT", "SR",
+                       "log_WSR", "RH_12h",
+                       "PM10_lag1", "PM10_lag3",
+                       "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    )
+  } else if (objetivo == "PM2.5") {
+    list(
+      vars_extra = c("TOUT", "SR", "WSR", "RH"),
+      vars_modelo = c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF",
+                       "PM10", "PM2.5", "TOUT", "SR",
+                       "log_WSR", "RH_12h",
+                       "PM2.5_lag1", "PM2.5_lag3",
+                       "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    )
+  }
+}
+
+# Calcula todas las variables derivadas (no lineales, acumulaciones, rezagos).
+# `medias_imputacion`: si se proveen (del entrenamiento), se usan para rellenar
+# NA en datos nuevos; si es NULL, se calculan sobre el propio `df` (uso en
+# entrenamiento) y se devuelven para reutilizarlas después en predicción.
+calcular_features <- function(datos, estacion_sel, objetivo, medias_imputacion = NULL) {
+  cfg <- obtener_config_objetivo(objetivo)
+  vars_base_local <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", "PM10", "PM2.5")
+  vars_pred <- unique(c(vars_base_local, cfg$vars_extra))
+
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    arrange(date) %>%
+    mutate(across(-date, ~ ifelse(.x < 0, NA, .x)))
+
+  # --- Imputación de NA ---
+  cols_a_imputar <- setdiff(names(df), "date")
+  if (is.null(medias_imputacion)) {
+    medias_imputacion <- map_dbl(df[cols_a_imputar], ~ mean(.x, na.rm = TRUE))
+  }
+  df <- df %>%
+    mutate(across(all_of(cols_a_imputar), function(x) {
+      nombre <- cur_column()
+      media <- medias_imputacion[[nombre]]
+      ifelse(is.na(x), media, x)
+    }))
+
+  df <- agregar_variables_ciclicas(df)
+
+  # --- Transformaciones no lineales, acumulaciones y rezagos por objetivo ---
+  if (objetivo == "O3") {
+    df <- df %>%
+      mutate(
+        TOUT2  = TOUT^2,
+        log_SR = log(SR + 1),
+        RH_6h  = zoo::rollapply(RH, width = 6, FUN = mean, fill = NA,
+                                 align = "right", partial = TRUE),
+        O3_lag1 = dplyr::lag(O3, 1),
+        O3_lag2 = dplyr::lag(O3, 2)
+      )
+  } else if (objetivo == "PM10") {
+    df <- df %>%
+      mutate(
+        log_WSR = log(WSR + 0.1),
+        RH_12h  = zoo::rollapply(RH, width = 12, FUN = mean, fill = NA,
+                                  align = "right", partial = TRUE),
+        PM10_lag1 = dplyr::lag(PM10, 1),
+        PM10_lag3 = dplyr::lag(PM10, 3)
+      )
+  } else if (objetivo == "PM2.5") {
+    df <- df %>%
+      mutate(
+        log_WSR = log(WSR + 0.1),
+        RH_12h  = zoo::rollapply(RH, width = 12, FUN = mean, fill = NA,
+                                  align = "right", partial = TRUE),
+        `PM2.5_lag1` = dplyr::lag(`PM2.5`, 1),
+        `PM2.5_lag3` = dplyr::lag(`PM2.5`, 3)
+      )
+  }
+
+  # Imputa NA generados por rezagos/acumulaciones (primeras filas) con la media
+  cols_derivadas <- setdiff(names(df), c("date", cols_a_imputar, "hora", "mes_num",
+                                          "hora_sin", "hora_cos", "mes_sin", "mes_cos"))
+  df <- df %>%
+    mutate(across(all_of(cols_derivadas), ~ ifelse(is.na(.x), mean(.x, na.rm = TRUE), .x)))
+
+  list(datos = df, medias_imputacion = medias_imputacion, vars_modelo = cfg$vars_modelo)
+}
+```
+
+# 4. Entrenamiento del modelo final
+
+```{r fn-entrenar}
+entrenar_modelo_final <- function(datos, estacion_sel, objetivo) {
+  prep <- calcular_features(datos, estacion_sel, objetivo, medias_imputacion = NULL)
+  df_final <- prep$datos
+
+  vars_existentes <- intersect(prep$vars_modelo, names(df_final))
+  modelo_df <- df_final %>% select(all_of(vars_existentes), all_of(objetivo))
+
+  # Elimina variables con varianza cero (protección ante datos degenerados)
+  vars_predictoras <- setdiff(names(modelo_df), objetivo)
+  varianzas <- sapply(modelo_df[, vars_predictoras], function(x) var(x, na.rm = TRUE))
+  vars_eliminar <- names(varianzas[varianzas == 0 | is.na(varianzas)])
+  if (length(vars_eliminar) > 0) {
+    modelo_df <- modelo_df %>% select(-all_of(vars_eliminar))
+  }
+
+  modelo <- lm(as.formula(paste0("`", objetivo, "` ~ .")),
+               data = modelo_df, na.action = na.omit)
+
+  list(
+    modelo             = modelo,
+    estacion           = estacion_sel,
+    objetivo           = objetivo,
+    medias_imputacion  = prep$medias_imputacion,
+    vars_modelo        = setdiff(names(modelo_df), objetivo),
+    n_entrenamiento    = nrow(modelo$model)
+  )
+}
+```
+
+# 5. Entrenar los 9 modelos (3 estaciones × 3 contaminantes)
+
+```{r entrenar-todos}
+# Cambia a FALSE si ya tienes un .rds guardado y solo quieres predecir
+REENTRENAR <- TRUE
+
+if (REENTRENAR) {
+  base_completa_train <- cargar_multiples_anios(archivos_entrenamiento, STATIONS)
+
+  modelos_finales <- list()
+  for (est in STATIONS) {
+    for (obj in TARGETS) {
+      nombre <- paste0(est, "_", obj)
+      modelos_finales[[nombre]] <- entrenar_modelo_final(base_completa_train, est, obj)
+    }
+  }
+
+  saveRDS(modelos_finales, ruta_modelos)
+} else {
+  modelos_finales <- readRDS(ruta_modelos)
+}
+
+tibble(
+  modelo = names(modelos_finales),
+  n_obs  = map_dbl(modelos_finales, "n_entrenamiento")
+) %>% kable()
+```
+
+# 6. Predicción sobre datos nuevos
+
+```{r fn-predecir}
+predecir_nuevo <- function(modelo_entrenado, datos_nuevos) {
+  objetivo   <- modelo_entrenado$objetivo
+  estacion   <- modelo_entrenado$estacion
+
+  prep <- calcular_features(datos_nuevos, estacion, objetivo,
+                             medias_imputacion = modelo_entrenado$medias_imputacion)
+  df_final <- prep$datos
+
+  vars_necesarias <- modelo_entrenado$vars_modelo
+  faltantes <- setdiff(vars_necesarias, names(df_final))
+  if (length(faltantes) > 0) {
+    stop(sprintf("Faltan variables requeridas por el modelo (%s, %s): %s",
+                  estacion, objetivo, paste(faltantes, collapse = ", ")))
+  }
+
+  prediccion <- predict(modelo_entrenado$modelo, newdata = df_final)
+
+  # Se extraen estos valores ANTES de construir el tibble: si se calcularan
+  # dentro de tibble(), la columna "objetivo" recién creada "taparía" a la
+  # variable objetivo (mismo nombre), rompiendo df_final[[objetivo]].
+  fechas             <- df_final$date
+  valores_observados <- df_final[[objetivo]]
+
+  resultado <- tibble(
+    date       = fechas,
+    estacion   = estacion,
+    objetivo   = objetivo,
+    observado  = valores_observados,
+    predicho   = as.numeric(prediccion)
+  )
+
+  resultado
+}
+```
+
+```{r cargar-datos-nuevos}
+datos_nuevos <- cargar_multiples_anios(
+  list("nuevo" = archivo_datos_nuevos),
+  STATIONS
+)
+```
+
+```{r ejecutar-predicciones}
+predicciones <- map_dfr(names(modelos_finales), function(nombre) {
+  predecir_nuevo(modelos_finales[[nombre]], datos_nuevos)
+})
+
+kable(head(predicciones, 20))
+```
+
+# 7. Análisis de precisión del modelo (solo si `observado` está disponible en los datos nuevos)
+
+Si tus datos nuevos ya traen el valor real del contaminante (por ejemplo,
+para validar el modelo contra un periodo reciente), se calcula aquí qué tan
+preciso fue el modelo. Si `observado` viene vacío (predicción pura hacia el
+futuro), esta sección se omite automáticamente.
+
+```{r metricas-precision}
+predicciones_evaluables <- predicciones %>% filter(!is.na(observado))
+
+hay_evaluacion <- nrow(predicciones_evaluables) > 0
+
+if (hay_evaluacion) {
+  metricas_precision <- predicciones_evaluables %>%
+    group_by(estacion, objetivo) %>%
+    summarise(
+      n_evaluado = n(),
+      R2   = round(cor(observado, predicho, use = "complete.obs")^2, 4),
+      MAE  = round(mean(abs(observado - predicho)), 3),
+      RMSE = round(sqrt(mean((observado - predicho)^2)), 3),
+      MAPE = round(mean(abs((observado - predicho) / observado), na.rm = TRUE) * 100, 2),
+      .groups = "drop"
+    )
+
+  kable(metricas_precision, caption = "Precisión del modelo por estación y contaminante")
+} else {
+  cat("Los datos nuevos no incluyen valores observados: predicción pura, sin métricas de precisión.")
+}
+```
+
+## 7.1 Predicho vs. observado
+
+```{r plot-precision-dispersión, fig.width=7, fig.height=5}
+if (hay_evaluacion) {
+  combinaciones <- predicciones_evaluables %>%
+    distinct(estacion, objetivo) %>%
+    arrange(estacion, objetivo)
+
+  for (i in seq_len(nrow(combinaciones))) {
+    est <- combinaciones$estacion[i]
+    obj <- combinaciones$objetivo[i]
+
+    datos_plot <- predicciones_evaluables %>%
+      filter(estacion == est, objetivo == obj)
+
+    p <- ggplot(datos_plot, aes(x = observado, y = predicho)) +
+      geom_point(alpha = 0.25, size = 0.8, color = "steelblue") +
+      geom_abline(slope = 1, intercept = 0, color = "firebrick", linewidth = 0.8) +
+      labs(
+        title = paste0("Predicho vs. Observado — ", obj, " (", est, ")"),
+        subtitle = "Línea roja = predicción perfecta (y = x)",
+        x = "Observado", y = "Predicho"
+      ) +
+      theme_minimal(base_size = 11)
+
+    print(p)
+  }
+}
+```
+
+## 7.2 Serie de tiempo: observado vs. predicho
+
+```{r plot-precision-serie, fig.width=8, fig.height=4}
+if (hay_evaluacion) {
+  for (i in seq_len(nrow(combinaciones))) {
+    est <- combinaciones$estacion[i]
+    obj <- combinaciones$objetivo[i]
+
+    datos_plot <- predicciones_evaluables %>%
+      filter(estacion == est, objetivo == obj) %>%
+      pivot_longer(c(observado, predicho), names_to = "tipo", values_to = "valor")
+
+    p <- ggplot(datos_plot, aes(x = date, y = valor, color = tipo)) +
+      geom_line(linewidth = 0.5) +
+      scale_color_manual(values = c("observado" = "grey30", "predicho" = "firebrick"),
+                          name = NULL) +
+      labs(
+        title = paste0("Observado vs. predicho — ", obj, " (", est, ")"),
+        x = NULL, y = NULL
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "top")
+
+    print(p)
+  }
+}
+```
+
+# 8. Exportar resultados
+
+```{r exportar}
+# write_xlsx(predicciones, ruta_salida_predicciones)
+cat("Predicciones guardadas en:", normalizePath(ruta_salida_predicciones, mustWork = FALSE), "\n")
+```
