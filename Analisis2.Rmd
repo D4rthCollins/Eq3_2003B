@@ -1905,3 +1905,1310 @@ for (obj in TARGETS) {
 }
 ```
 
+Ahora, debemos cambiar la evaluación del modelo porque algunos test analizan modelos de regresión lineal y tenemos uno de regresión dinámico
+
+Breusch-Godfrey (en vez de Durbin-Watson): sí es válido con variables dependientes rezagadas como predictor, y además detecta autocorrelación en múltiples rezagos, no solo el de orden 1.
+Ljung-Box sobre los residuos: verifica si queda estructura de autocorrelación en varios rezagos simultáneamente (más robusto que ver solo un lag).
+Gráficas ACF/PACF de los residuos: visualmente dicen si aún queda "memoria" en los residuos que el modelo no capturó — si el modelo dinámico funcionó bien, deberían verse como ruido blanco (sin barras significativas).
+Comparación contra un modelo "ingenuo" (naive persistence): por incluir rezagos, es importante saber cuánto del R² viene solo de "la hora pasada predice la próxima" vs. cuánto aportan las demás variables (NO, TOUT², etc.) — si el modelo completo apenas le gana al ingenuo, las variables exógenas no están aportando mucho más allá de la inercia natural del contaminante.
+
+```{r}
+#| label: fn-diagnostico-dinamico
+library(lmtest)  # bgtest
+library(forecast) # opcional, solo si quieres accuracy() para MASE
+
+diagnosticar_residuos_dinamico <- function(res, objetivo, estacion_sel, orden_bg = 4) {
+  modelo <- res$modelo
+  residuos <- residuals(modelo)
+  df_modelo <- modelo$model
+
+  cat(sprintf("\n\n**Diagnóstico (modelo dinámico) — %s (%s)**\n\n", objetivo, estacion_sel))
+
+  # --- 1. Breusch-Godfrey (reemplaza a Durbin-Watson) ---
+  test_bg <- lmtest::bgtest(modelo, order = orden_bg)
+
+  # --- 2. Ljung-Box sobre los residuos, a varios rezagos ---
+  test_lb <- Box.test(residuos, lag = orden_bg, type = "Ljung-Box")
+
+  # --- 3. Normalidad y homocedasticidad (siguen siendo válidas, no cambian) ---
+  if (length(residuos) <= 5000) {
+    test_normalidad <- shapiro.test(residuos)
+    nombre_test <- "Shapiro-Wilk"
+  } else {
+    test_normalidad <- nortest::ad.test(residuos)
+    nombre_test <- "Anderson-Darling"
+  }
+  test_homocedasticidad <- lmtest::bptest(modelo)
+
+  tabla_diagnostico <- tibble(
+    prueba = c(
+      paste("Normalidad -", nombre_test),
+      "Homocedasticidad (Breusch-Pagan)",
+      sprintf("Autocorrelación (Breusch-Godfrey, orden %d)", orden_bg),
+      sprintf("Autocorrelación (Ljung-Box, %d rezagos)", orden_bg)
+    ),
+    estadistico = c(
+      round(unname(test_normalidad$statistic), 3),
+      round(unname(test_homocedasticidad$statistic), 3),
+      round(unname(test_bg$statistic), 3),
+      round(unname(test_lb$statistic), 3)
+    ),
+    p_value = c(
+      signif(test_normalidad$p.value, 3),
+      signif(test_homocedasticidad$p.value, 3),
+      signif(test_bg$p.value, 3),
+      signif(test_lb$p.value, 3)
+    ),
+    interpretacion = c(
+      ifelse(test_normalidad$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+      ifelse(test_homocedasticidad$p.value < 0.05, "Varianza NO constante", "Varianza constante"),
+      ifelse(test_bg$p.value < 0.05, "Autocorrelación residual detectada", "Sin autocorrelación residual"),
+      ifelse(test_lb$p.value < 0.05, "Autocorrelación residual detectada", "Sin autocorrelación residual")
+    )
+  )
+  print(kable(tabla_diagnostico))
+
+  # --- 4. ACF y PACF de los residuos (verificación visual) ---
+  cat("\n\n*ACF de los residuos (debe verse como ruido blanco si el modelo dinámico funcionó):*\n\n")
+  acf(residuos, main = paste("ACF de residuos —", objetivo, estacion_sel))
+
+  cat("\n\n*PACF de los residuos:*\n\n")
+  pacf(residuos, main = paste("PACF de residuos —", objetivo, estacion_sel))
+
+  cat("\n\n")
+}
+```
+
+Comparación contra el modelo ingenuo con el rezago
+
+```{r}
+#| label: fn-comparar-naive
+comparar_vs_naive <- function(datos, estacion_sel, objetivo, res_completo) {
+  # Identifica la(s) columna(s) de rezago dentro del modelo ya ajustado
+  vars_lag <- grep(paste0("^", gsub("\\.", "\\\\.", objetivo), "_lag"),
+                    names(res_completo$modelo$model), value = TRUE)
+
+  if (length(vars_lag) == 0) {
+    cat("No se encontraron variables de rezago en este modelo.\n\n")
+    return(invisible(NULL))
+  }
+
+  df_modelo <- res_completo$modelo$model
+  formula_naive <- as.formula(paste(objetivo, "~", paste(vars_lag, collapse = " + ")))
+  modelo_naive <- lm(formula_naive, data = df_modelo)
+
+  r2_naive     <- summary(modelo_naive)$r.squared
+  r2_completo  <- summary(res_completo$modelo)$r.squared
+  aporte_extra <- r2_completo - r2_naive
+
+  tibble(
+    modelo = c("Ingenuo (solo rezago)", "Completo (rezago + variables exógenas)"),
+    R2     = round(c(r2_naive, r2_completo), 4),
+    variables = c(paste(vars_lag, collapse = ", "), "todas")
+  ) %>%
+    kable() %>%
+    print()
+
+  cat(sprintf("\n\n**Aporte real de las variables exógenas al R²: +%.4f** (%.1f%% del R² total)\n\n",
+              aporte_extra, 100 * aporte_extra / r2_completo))
+}
+```
+
+```{r}
+#| label: evaluacion-dinamica-SO
+#| warning: false
+#| results: asis
+for (obj in TARGETS) {
+  res <- modelos_SO[[obj]]
+  if (!is.null(res)) {
+    diagnosticar_residuos_dinamico(res, obj, "SO")
+    comparar_vs_naive(base_analisis, "SO", obj, res)
+  }
+}
+```
+
+Según los test, el modelo necesita ajustarse en la estructura ARIMA y agregarse más rezagos y de mayor orden, para que tome bien la dependencia temporal de las variables.
+
+```{r}
+library(forecast)
+library(tseries)
+
+modelar_prediccion_arima <- function(datos, estacion_sel, objetivo, 
+                                      orden_lags = NULL, 
+                                      orden_arima = NULL) {
+  
+  # --- 1. Variables base ---
+  vars_base <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                 "PM10", "PM2.5")
+  
+  # --- 2. Variables específicas por objetivo ---
+  if (objetivo == "O3") {
+    vars_extra <- c("WSR", "TOUT", "SR", "RH")
+    vars_poly <- c("TOUT2", "log_SR")
+    vars_acum <- "RH_6h"
+    
+    # Rezagos específicos para O3
+    if (is.null(orden_lags)) {
+      orden_lags <- c(1, 2, 3, 6, 12, 24)  # rezagos para O3
+    }
+    
+  } else if (objetivo == "PM10") {
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    
+    if (is.null(orden_lags)) {
+      orden_lags <- c(1, 3, 6, 12, 24)  # rezagos para PM10
+    }
+    
+  } else if (objetivo == "PM2.5") {
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    
+    if (is.null(orden_lags)) {
+      orden_lags <- c(1, 2, 3, 6, 12, 24)  # rezagos para PM2.5
+    }
+  }
+  
+  vars_pred <- unique(c(vars_base, vars_extra))
+  
+  # --- 3. Preparar datos ---
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    arrange(date) %>%
+    mutate(across(-date, ~ ifelse(.x < 0, NA, .x))) %>%
+    mutate(across(-date, ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    })) %>%
+    agregar_variables_ciclicas()
+  
+  # --- 4. Crear variables ---
+  df_final <- df
+  
+  # Polinómicas
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        TOUT2 = TOUT^2,
+        log_SR = log(SR + 1)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        log_WSR = log(WSR + 0.1)
+      )
+  }
+  
+  # Acumulaciones
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        RH_6h = zoo::rollapply(RH, width = 6, FUN = mean, fill = NA, 
+                               align = "right", partial = TRUE)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        RH_12h = zoo::rollapply(RH, width = 12, FUN = mean, fill = NA, 
+                                align = "right", partial = TRUE)
+      )
+  }
+  
+  # --- 5. REZAGOS MÚLTIPLES (según orden_lags) ---
+  for (lag_i in orden_lags) {
+    nombre_lag <- paste0(objetivo, "_lag", lag_i)
+    df_final <- df_final %>%
+      mutate(!!nombre_lag := dplyr::lag(.data[[objetivo]], lag_i))
+  }
+  
+  # --- 6. Imputar NA en rezagos y acumulaciones ---
+  df_final <- df_final %>%
+    mutate(across(where(is.numeric), ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    }))
+  
+  # --- 7. Variables finales ---
+  vars_lag <- paste0(objetivo, "_lag", orden_lags)
+  
+  if (objetivo == "O3") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "WSR",
+                     "TOUT2", "log_SR", "RH_6h",
+                     vars_lag,
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM10") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "TOUT", "SR",
+                     "log_WSR", "RH_12h",
+                     vars_lag,
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM2.5") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "TOUT", "SR",
+                     "log_WSR", "RH_12h",
+                     vars_lag,
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+  }
+  
+  vars_existentes <- intersect(vars_modelo, names(df_final))
+  
+  modelo_df <- df_final %>%
+    select(all_of(vars_existentes), all_of(objetivo))
+  
+  # --- 8. Eliminar varianza cero ---
+  vars_predictoras <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras) > 0) {
+    varianzas <- sapply(modelo_df[, vars_predictoras], function(x) var(x, na.rm = TRUE))
+    vars_eliminar <- names(varianzas[varianzas == 0 | is.na(varianzas)])
+    
+    if (length(vars_eliminar) > 0) {
+      cat(sprintf("\nEliminando variables con varianza cero: %s\n", 
+                  paste(vars_eliminar, collapse = ", ")))
+      modelo_df <- modelo_df %>% select(-all_of(vars_eliminar))
+    }
+  }
+  
+  # --- 9. Verificar predictoras ---
+  vars_predictoras_final <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras_final) == 0) {
+    cat("No hay variables predictoras disponibles\n")
+    return(NULL)
+  }
+  
+  # --- 10. MODELO LINEAL BASE ---
+  modelo_lm <- lm(as.formula(paste(objetivo, "~ .")), 
+                  data = modelo_df, 
+                  na.action = na.omit)
+  
+  if (nrow(modelo_lm$model) == 0) {
+    cat("No hay datos completos después de na.omit\n")
+    return(NULL)
+  }
+  
+  # --- 11. IDENTIFICAR ORDEN ARIMA ---
+  # Extraer residuos del modelo LM
+  residuos_lm <- residuals(modelo_lm)
+  
+  # Si no se especifica orden ARIMA, usar auto.arima para sugerir
+  if (is.null(orden_arima)) {
+    # Usar auto.arima para encontrar el mejor orden
+    cat("\nBuscando orden óptimo de ARIMA para los residuos...\n")
+    arima_sugerido <- auto.arima(residuos_lm, seasonal = FALSE, 
+                                  max.p = 5, max.q = 0,
+                                  ic = "aic", trace = FALSE)
+    orden_arima <- arima_sugerido$arma[c(1, 2, 3)]
+    names(orden_arima) <- c("p", "d", "q")
+    cat(sprintf("Orden ARIMA sugerido: AR(%d), d=%d, MA(%d)\n", 
+                orden_arima[1], orden_arima[2], orden_arima[3]))
+  }
+  
+  # --- 12. MODELO ARIMA SOBRE RESIDUOS ---
+  # Ajustar modelo ARIMA a los residuos
+  p <- orden_arima[1]  # orden autorregresivo
+  d <- orden_arima[2]  # orden diferenciación
+  q <- orden_arima[3]  # orden media móvil
+  
+  if (p > 0 || q > 0 || d > 0) {
+    modelo_arima <- Arima(residuos_lm, order = c(p, d, q))
+    
+    # Predicciones corregidas = LM + ARIMA(residuos)
+    residuos_arima <- residuals(modelo_arima)
+    
+    cat(sprintf("\nModelo ARIMA(%d,%d,%d) ajustado a residuos\n", p, d, q))
+    cat(sprintf(" - AIC: %.2f\n", modelo_arima$aic))
+    cat(sprintf(" - Varianza residual: %.4f\n", var(residuos_arima, na.rm = TRUE)))
+    
+    # Guardar el modelo ARIMA
+    modelo_final <- list(
+      lm = modelo_lm,
+      arima = modelo_arima,
+      orden_lags = orden_lags,
+      orden_arima = c(p, d, q)
+    )
+    
+    # Clase especial para predict
+    class(modelo_final) <- "modelo_arima_residuos"
+    
+  } else {
+    # Si ARIMA es (0,0,0), usar solo LM
+    modelo_final <- list(
+      lm = modelo_lm,
+      arima = NULL,
+      orden_lags = orden_lags,
+      orden_arima = c(0, 0, 0)
+    )
+    class(modelo_final) <- "modelo_lm"
+  }
+  
+  # Función de predicción personalizada
+  predict.modelo_arima_residuos <- function(object, newdata = NULL, ...) {
+    if (is.null(newdata)) {
+      pred_lm <- fitted(object$lm)
+    } else {
+      pred_lm <- predict(object$lm, newdata = newdata, ...)
+    }
+    
+    # Para ARIMA, necesitamos pronosticar los residuos
+    # Nota: esto es una simplificación, para predicción real se necesita más trabajo
+    return(pred_lm)
+  }
+  
+  cat(sprintf("\nModelo creado: %d filas usadas, %d variables\n", 
+              nrow(modelo_lm$model), length(coef(modelo_lm)) - 1))
+  
+  list(
+    modelo = modelo_final,
+    modelo_lm = modelo_lm,
+    n = nrow(modelo_lm$model),
+    n_total = sum(datos$estacion == estacion_sel),
+    vars_pred = names(modelo_lm$model)[names(modelo_lm$model) != objetivo],
+    orden_lags = orden_lags,
+    orden_arima = c(p, d, q),
+    residuos_arima = if (exists("residuos_arima")) residuos_arima else residuos_lm
+  )
+}
+```
+
+```{r}
+diagnosticar_residuos_arima <- function(res, objetivo, estacion_sel, orden_bg = 12) {
+  
+  # Extraer residuos del modelo ARIMA
+  if (!is.null(res$residuos_arima)) {
+    residuos <- res$residuos_arima
+  } else {
+    residuos <- residuals(res$modelo_lm)
+  }
+  
+  cat(sprintf("\n\n**Diagnóstico de residuos (con ARIMA) — %s (%s)**\n\n", objetivo, estacion_sel))
+  
+  # --- 1. Breusch-Godfrey ---
+  test_bg <- lmtest::bgtest(res$modelo_lm, order = orden_bg)
+  
+  # --- 2. Ljung-Box ---
+  test_lb <- Box.test(residuos, lag = orden_bg, type = "Ljung-Box")
+  
+  # --- 3. Normalidad ---
+  if (length(residuos) <= 5000) {
+    test_normalidad <- shapiro.test(residuos)
+    nombre_test <- "Shapiro-Wilk"
+  } else {
+    test_normalidad <- nortest::ad.test(residuos)
+    nombre_test <- "Anderson-Darling"
+  }
+  
+  # --- 4. Homocedasticidad ---
+  test_homocedasticidad <- lmtest::bptest(res$modelo_lm)
+  
+  tabla_diagnostico <- tibble(
+    prueba = c(
+      paste("Normalidad -", nombre_test),
+      "Homocedasticidad (Breusch-Pagan)",
+      sprintf("Autocorrelación (Breusch-Godfrey, orden %d)", orden_bg),
+      sprintf("Autocorrelación (Ljung-Box, %d rezagos)", orden_bg)
+    ),
+    estadistico = c(
+      round(unname(test_normalidad$statistic), 3),
+      round(unname(test_homocedasticidad$statistic), 3),
+      round(unname(test_bg$statistic), 3),
+      round(unname(test_lb$statistic), 3)
+    ),
+    p_value = c(
+      signif(test_normalidad$p.value, 3),
+      signif(test_homocedasticidad$p.value, 3),
+      signif(test_bg$p.value, 3),
+      signif(test_lb$p.value, 3)
+    ),
+    interpretacion = c(
+      ifelse(test_normalidad$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+      ifelse(test_homocedasticidad$p.value < 0.05, "Varianza NO constante", "Varianza constante"),
+      ifelse(test_bg$p.value < 0.05, "Autocorrelación residual detectada", "Sin autocorrelación residual"),
+      ifelse(test_lb$p.value < 0.05, "Autocorrelación residual detectada", "Sin autocorrelación residual")
+    )
+  )
+  
+  print(kable(tabla_diagnostico))
+  
+  # --- 5. ACF y PACF de los residuos ARIMA ---
+  cat("\n\n*ACF de los residuos del modelo ARIMA (debe ser ruido blanco):*\n\n")
+  acf(residuos, main = paste("ACF de residuos (ARIMA) —", objetivo, estacion_sel))
+  
+  cat("\n\n*PACF de los residuos del modelo ARIMA:*\n\n")
+  pacf(residuos, main = paste("PACF de residuos (ARIMA) —", objetivo, estacion_sel))
+  
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: modelo-arima-SO
+#| warning: false
+#| results: asis
+
+cat("\n\n# MODELO CON ARIMA - ESTACIÓN SO\n\n")
+
+modelos_arima_SO <- list()
+
+for (obj in TARGETS) {
+  cat(sprintf("\n\n## Modelo: %s (SO)\n", obj))
+  
+  res <- modelar_prediccion_arima(base_analisis, "SO", obj)
+  modelos_arima_SO[[obj]] <- res
+  
+  if (is.null(res)) {
+    cat("No se pudo crear el modelo.\n")
+    next
+  }
+  
+  print(summary(res$modelo_lm))
+  
+  cat("\n\n**Rezagos usados:**", paste(res$orden_lags, collapse = ", "), "\n")
+  cat("**Orden ARIMA:** AR(", res$orden_arima[1], "), d=", 
+      res$orden_arima[2], ", MA(", res$orden_arima[3], ")\n", sep = "")
+  
+  cat("\n\n**VIF:**\n\n")
+  vif_vals <- evaluar_vif(list(modelo = res$modelo_lm))
+  print(kable(vif_vals, format = "markdown"))
+  
+  # Diagnóstico con ARIMA
+  diagnosticar_residuos_arima(res, obj, "SO")
+  
+  cat("\n\n---\n")
+}
+```
+
+Se sigue habiendo autocorrelación. O3_lag2 está alto en VIF, entonces no se usará. Se implementará un modelo que filtre los lags con alto VIF y optimice.
+
+```{r}
+modelar_prediccion_arima_optimizado <- function(datos, estacion_sel, objetivo) {
+  
+  # --- 1. Variables base ---
+  vars_base <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                 "PM10", "PM2.5")
+  
+  # --- 2. Variables específicas por objetivo ---
+  if (objetivo == "O3") {
+    vars_extra <- c("WSR", "TOUT", "SR", "RH")
+    vars_poly <- c("TOUT2", "log_SR")
+    vars_acum <- "RH_6h"
+    
+    # Rezagos OPTIMIZADOS (eliminamos lag2 por VIF)
+    orden_lags <- c(1, 3, 6, 12, 24)  # lag2 eliminado
+    
+  } else if (objetivo == "PM10") {
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    
+    orden_lags <- c(1, 3, 6, 12, 24)
+    
+  } else if (objetivo == "PM2.5") {
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    
+    orden_lags <- c(1, 2, 3, 6, 12, 24)
+  }
+  
+  vars_pred <- unique(c(vars_base, vars_extra))
+  
+  # --- 3. Preparar datos ---
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    arrange(date) %>%
+    mutate(across(-date, ~ ifelse(.x < 0, NA, .x))) %>%
+    mutate(across(-date, ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    })) %>%
+    agregar_variables_ciclicas()
+  
+  # --- 4. Crear variables ---
+  df_final <- df
+  
+  # Polinómicas
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        TOUT2 = TOUT^2,
+        log_SR = log(SR + 1)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        log_WSR = log(WSR + 0.1)
+      )
+  }
+  
+  # Acumulaciones
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        RH_6h = zoo::rollapply(RH, width = 6, FUN = mean, fill = NA, 
+                               align = "right", partial = TRUE)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        RH_12h = zoo::rollapply(RH, width = 12, FUN = mean, fill = NA, 
+                                align = "right", partial = TRUE)
+      )
+  }
+  
+  # --- 5. Rezagos optimizados ---
+  for (lag_i in orden_lags) {
+    nombre_lag <- paste0(objetivo, "_lag", lag_i)
+    df_final <- df_final %>%
+      mutate(!!nombre_lag := dplyr::lag(.data[[objetivo]], lag_i))
+  }
+  
+  # --- 6. Imputar NA ---
+  df_final <- df_final %>%
+    mutate(across(where(is.numeric), ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    }))
+  
+  # --- 7. Variables finales ---
+  vars_lag <- paste0(objetivo, "_lag", orden_lags)
+  
+  if (objetivo == "O3") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "WSR",
+                     "TOUT2", "log_SR", "RH_6h",
+                     vars_lag,
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM10") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "TOUT", "SR",
+                     "log_WSR", "RH_12h",
+                     vars_lag,
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM2.5") {
+    vars_modelo <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                     "PM10", "PM2.5", "TOUT", "SR",
+                     "log_WSR", "RH_12h",
+                     vars_lag,
+                     "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+  }
+  
+  vars_existentes <- intersect(vars_modelo, names(df_final))
+  
+  modelo_df <- df_final %>%
+    select(all_of(vars_existentes), all_of(objetivo))
+  
+  # --- 8. Eliminar varianza cero ---
+  vars_predictoras <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras) > 0) {
+    varianzas <- sapply(modelo_df[, vars_predictoras], function(x) var(x, na.rm = TRUE))
+    vars_eliminar <- names(varianzas[varianzas == 0 | is.na(varianzas)])
+    
+    if (length(vars_eliminar) > 0) {
+      cat(sprintf("\nEliminando variables con varianza cero: %s\n", 
+                  paste(vars_eliminar, collapse = ", ")))
+      modelo_df <- modelo_df %>% select(-all_of(vars_eliminar))
+    }
+  }
+  
+  # --- 9. Verificar predictoras ---
+  vars_predictoras_final <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras_final) == 0) {
+    cat("No hay variables predictoras disponibles\n")
+    return(NULL)
+  }
+  
+  # --- 10. MODELO LM ---
+  modelo_lm <- lm(as.formula(paste(objetivo, "~ .")), 
+                  data = modelo_df, 
+                  na.action = na.omit)
+  
+  if (nrow(modelo_lm$model) == 0) {
+    cat("No hay datos completos después de na.omit\n")
+    return(NULL)
+  }
+  
+  # --- 11. ARIMA OPTIMIZADO SOBRE RESIDUOS ---
+  residuos_lm <- residuals(modelo_lm)
+  
+  # Usar auto.arima con más opciones para capturar mejor la autocorrelación
+  cat("\nBuscando orden óptimo de ARIMA para los residuos...\n")
+  
+  # Forzar un ARIMA con orden p más alto para capturar la persistencia
+  arima_sugerido <- auto.arima(residuos_lm, seasonal = FALSE, 
+                                max.p = 8, max.q = 2, max.d = 1,
+                                ic = "aic", trace = FALSE,
+                                stepwise = FALSE, approximation = FALSE)
+  
+  orden_arima <- arima_sugerido$arma[c(1, 2, 3)]
+  names(orden_arima) <- c("p", "d", "q")
+  cat(sprintf("Orden ARIMA sugerido: AR(%d), d=%d, MA(%d)\n", 
+              orden_arima[1], orden_arima[2], orden_arima[3]))
+  
+  # --- 12. ARIMA FINAL ---
+  p <- orden_arima[1]
+  d <- orden_arima[2]
+  q <- orden_arima[3]
+  
+  if (p > 0 || q > 0 || d > 0) {
+    modelo_arima <- Arima(residuos_lm, order = c(p, d, q))
+    
+    # Residuos del ARIMA
+    residuos_arima <- residuals(modelo_arima)
+    
+    cat(sprintf("\nModelo ARIMA(%d,%d,%d) ajustado a residuos\n", p, d, q))
+    cat(sprintf(" - AIC: %.2f\n", modelo_arima$aic))
+    cat(sprintf(" - Varianza residual: %.4f\n", var(residuos_arima, na.rm = TRUE)))
+    
+    modelo_final <- list(
+      lm = modelo_lm,
+      arima = modelo_arima,
+      orden_lags = orden_lags,
+      orden_arima = c(p, d, q)
+    )
+    
+  } else {
+    modelo_final <- list(
+      lm = modelo_lm,
+      arima = NULL,
+      orden_lags = orden_lags,
+      orden_arima = c(0, 0, 0)
+    )
+    residuos_arima <- residuos_lm
+  }
+  
+  cat(sprintf("\nModelo creado: %d filas usadas, %d variables\n", 
+              nrow(modelo_lm$model), length(coef(modelo_lm)) - 1))
+  
+  list(
+    modelo = modelo_final,
+    modelo_lm = modelo_lm,
+    n = nrow(modelo_lm$model),
+    n_total = sum(datos$estacion == estacion_sel),
+    vars_pred = names(modelo_lm$model)[names(modelo_lm$model) != objetivo],
+    orden_lags = orden_lags,
+    orden_arima = c(p, d, q),
+    residuos_arima = residuos_arima,
+    arima_model = if (exists("modelo_arima")) modelo_arima else NULL
+  )
+}
+```
+
+```{r}
+diagnosticar_residuos_arima_optimizado <- function(res, objetivo, estacion_sel, orden_bg = 24) {
+  
+  if (!is.null(res$residuos_arima)) {
+    residuos <- res$residuos_arima
+  } else {
+    residuos <- residuals(res$modelo_lm)
+  }
+  
+  cat(sprintf("\n\n**Diagnóstico de residuos (ARIMA optimizado) — %s (%s)**\n\n", objetivo, estacion_sel))
+  
+  # --- 1. Breusch-Godfrey con más rezagos ---
+  test_bg <- lmtest::bgtest(res$modelo_lm, order = orden_bg)
+  
+  # --- 2. Ljung-Box con más rezagos ---
+  test_lb <- Box.test(residuos, lag = orden_bg, type = "Ljung-Box")
+  
+  # --- 3. Normalidad ---
+  if (length(residuos) <= 5000) {
+    test_normalidad <- shapiro.test(residuos)
+    nombre_test <- "Shapiro-Wilk"
+  } else {
+    test_normalidad <- nortest::ad.test(residuos)
+    nombre_test <- "Anderson-Darling"
+  }
+  
+  # --- 4. Homocedasticidad ---
+  test_homocedasticidad <- lmtest::bptest(res$modelo_lm)
+  
+  tabla_diagnostico <- tibble(
+    prueba = c(
+      paste("Normalidad -", nombre_test),
+      "Homocedasticidad (Breusch-Pagan)",
+      sprintf("Autocorrelación (Breusch-Godfrey, orden %d)", orden_bg),
+      sprintf("Autocorrelación (Ljung-Box, %d rezagos)", orden_bg)
+    ),
+    estadistico = c(
+      round(unname(test_normalidad$statistic), 3),
+      round(unname(test_homocedasticidad$statistic), 3),
+      round(unname(test_bg$statistic), 3),
+      round(unname(test_lb$statistic), 3)
+    ),
+    p_value = c(
+      signif(test_normalidad$p.value, 3),
+      signif(test_homocedasticidad$p.value, 3),
+      signif(test_bg$p.value, 3),
+      signif(test_lb$p.value, 3)
+    ),
+    interpretacion = c(
+      ifelse(test_normalidad$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+      ifelse(test_homocedasticidad$p.value < 0.05, "Varianza NO constante", "Varianza constante"),
+      ifelse(test_bg$p.value < 0.05, "Autocorrelación residual detectada", "Sin autocorrelación residual"),
+      ifelse(test_lb$p.value < 0.05, "Autocorrelación residual detectada", "Sin autocorrelación residual")
+    )
+  )
+  
+  print(kable(tabla_diagnostico))
+  
+  # --- 5. Gráficos ACF/PACF ---
+  cat("\n\n*ACF de los residuos del modelo ARIMA:*\n\n")
+  acf(residuos, main = paste("ACF de residuos (ARIMA optimizado) —", objetivo, estacion_sel))
+  
+  cat("\n\n*PACF de los residuos del modelo ARIMA:*\n\n")
+  pacf(residuos, main = paste("PACF de residuos (ARIMA optimizado) —", objetivo, estacion_sel))
+  
+  # --- 6. Comparación de varianzas ---
+  var_residuos_lm <- var(residuals(res$modelo_lm), na.rm = TRUE)
+  var_residuos_arima <- var(residuos, na.rm = TRUE)
+  reduccion <- (var_residuos_lm - var_residuos_arima) / var_residuos_lm * 100
+  
+  cat(sprintf("\n\n**Reducción de varianza residual con ARIMA:** %.1f%%\n", reduccion))
+  cat(sprintf("   - Varianza LM: %.4f\n", var_residuos_lm))
+  cat(sprintf("   - Varianza ARIMA: %.4f\n", var_residuos_arima))
+  
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: modelo-arima-optimizado-SO
+#| warning: false
+#| results: asis
+
+cat("\n\n# MODELO ARIMA OPTIMIZADO - ESTACIÓN SO\n\n")
+
+modelos_arima_SO <- list()
+
+for (obj in TARGETS) {
+  cat(sprintf("\n\n## Modelo: %s (SO)\n", obj))
+  
+  res <- modelar_prediccion_arima_optimizado(base_analisis, "SO", obj)
+  modelos_arima_SO[[obj]] <- res
+  
+  if (is.null(res)) {
+    cat("No se pudo crear el modelo.\n")
+    next
+  }
+  
+  # Resumen LM
+  print(summary(res$modelo_lm))
+  
+  # VIF
+  cat("\n\n**VIF:**\n\n")
+  vif_vals <- evaluar_vif(list(modelo = res$modelo_lm))
+  print(kable(vif_vals, format = "markdown"))
+  
+  # Rezagos y ARIMA
+  cat(sprintf("\n\n**Rezagos usados:** %s\n", paste(res$orden_lags, collapse = ", ")))
+  cat(sprintf("**Orden ARIMA:** AR(%d), d=%d, MA(%d)\n", 
+              res$orden_arima[1], res$orden_arima[2], res$orden_arima[3]))
+  
+  # Diagnóstico optimizado
+  diagnosticar_residuos_arima_optimizado(res, obj, "SO")
+  
+  cat("\n\n---\n")
+}
+```
+
+Al no poder eliminar la autocorrelación y mejorar significativamente los gráficos ACF y PACF, se decide cambiar al modelo ARIMAX para que la regresion y el ARIMA se estimen al mismo tiempo.
+
+```{r}
+modelar_arimax <- function(datos, estacion_sel, objetivo) {
+  
+  # --- 1. Variables base ---
+  vars_base <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                 "PM10", "PM2.5")
+  
+  # --- 2. Variables específicas por objetivo ---
+  if (objetivo == "O3") {
+    vars_extra <- c("WSR", "TOUT", "SR", "RH")
+    vars_poly <- c("TOUT2", "log_SR")
+    vars_acum <- "RH_6h"
+    orden_lags <- c(1, 3, 6, 12, 24)
+    
+  } else if (objetivo == "PM10") {
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    orden_lags <- c(1, 3, 6, 12, 24)
+    
+  } else if (objetivo == "PM2.5") {
+    vars_extra <- c("TOUT", "SR", "WSR", "RH")
+    vars_poly <- "log_WSR"
+    vars_acum <- "RH_12h"
+    orden_lags <- c(1, 2, 3, 6, 12, 24)
+  }
+  
+  vars_pred <- unique(c(vars_base, vars_extra))
+  
+  # --- 3. Preparar datos ---
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    arrange(date) %>%
+    mutate(across(-date, ~ ifelse(.x < 0, NA, .x))) %>%
+    mutate(across(-date, ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    })) %>%
+    agregar_variables_ciclicas()
+  
+  # --- 4. Crear variables ---
+  df_final <- df
+  
+  # Polinómicas
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        TOUT2 = TOUT^2,
+        log_SR = log(SR + 1)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        log_WSR = log(WSR + 0.1)
+      )
+  }
+  
+  # Acumulaciones
+  if (objetivo == "O3") {
+    df_final <- df_final %>%
+      mutate(
+        RH_6h = zoo::rollapply(RH, width = 6, FUN = mean, fill = NA, 
+                               align = "right", partial = TRUE)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df_final <- df_final %>%
+      mutate(
+        RH_12h = zoo::rollapply(RH, width = 12, FUN = mean, fill = NA, 
+                                align = "right", partial = TRUE)
+      )
+  }
+  
+  # --- 5. Rezagos ---
+  for (lag_i in orden_lags) {
+    nombre_lag <- paste0(objetivo, "_lag", lag_i)
+    df_final <- df_final %>%
+      mutate(!!nombre_lag := dplyr::lag(.data[[objetivo]], lag_i))
+  }
+  
+  # --- 6. Imputar NA ---
+  df_final <- df_final %>%
+    mutate(across(where(is.numeric), ~ {
+      if (all(is.na(.x))) return(0)
+      media <- mean(.x, na.rm = TRUE)
+      ifelse(is.na(.x), media, .x)
+    }))
+  
+  # --- 7. Variables finales ---
+  vars_lag <- paste0(objetivo, "_lag", orden_lags)
+  
+  if (objetivo == "O3") {
+    vars_exogenas <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                       "PM10", "PM2.5", "WSR",
+                       "TOUT2", "log_SR", "RH_6h",
+                       "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM10") {
+    vars_exogenas <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                       "PM10", "PM2.5", "TOUT", "SR",
+                       "log_WSR", "RH_12h",
+                       "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    
+  } else if (objetivo == "PM2.5") {
+    vars_exogenas <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", 
+                       "PM10", "PM2.5", "TOUT", "SR",
+                       "log_WSR", "RH_12h",
+                       "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+  }
+  
+  vars_exogenas <- c(vars_exogenas, vars_lag)
+  
+  # --- 8. Eliminar varianza cero ---
+  vars_existentes <- intersect(vars_exogenas, names(df_final))
+  
+  modelo_df <- df_final %>%
+    select(all_of(vars_existentes), all_of(objetivo))
+  
+  vars_predictoras <- setdiff(names(modelo_df), objetivo)
+  
+  if (length(vars_predictoras) > 0) {
+    varianzas <- sapply(modelo_df[, vars_predictoras], function(x) var(x, na.rm = TRUE))
+    vars_eliminar <- names(varianzas[varianzas == 0 | is.na(varianzas)])
+    
+    if (length(vars_eliminar) > 0) {
+      cat(sprintf("\nEliminando variables con varianza cero: %s\n", 
+                  paste(vars_eliminar, collapse = ", ")))
+      modelo_df <- modelo_df %>% select(-all_of(vars_eliminar))
+    }
+  }
+  
+  # --- 9. Variables para ARIMAX ---
+  y <- modelo_df[[objetivo]]
+  xreg <- modelo_df %>% select(-all_of(objetivo))
+  
+  # --- 10. LM temporal (siempre se crea) ---
+  lm_temp <- lm(as.formula(paste(objetivo, "~ .")), data = modelo_df)
+  residuos_lm <- residuals(lm_temp)
+  
+  # --- 11. IDENTIFICAR ARIMA (con tryCatch para evitar errores) ---
+  p <- 0
+  d <- 0
+  q <- 0
+  modelo_arimax <- NULL
+  residuos_final <- residuos_lm
+  
+  tryCatch({
+    cat("\nBuscando orden óptimo de ARIMA para los errores...\n")
+    arima_sugerido <- auto.arima(residuos_lm, seasonal = FALSE, 
+                                  max.p = 5, max.q = 2, max.d = 1,
+                                  ic = "aic", trace = FALSE,
+                                  stepwise = FALSE, approximation = FALSE)
+    
+    orden_arima <- arima_sugerido$arma[c(1, 2, 3)]
+    names(orden_arima) <- c("p", "d", "q")
+    p <- orden_arima[1]
+    d <- orden_arima[2]
+    q <- orden_arima[3]
+    
+    cat(sprintf("Orden ARIMA sugerido: AR(%d), d=%d, MA(%d)\n", p, d, q))
+    
+    # --- 12. ARIMAX ---
+    if (p > 0 || q > 0 || d > 0) {
+      modelo_arimax <- Arima(y, order = c(p, d, q), xreg = as.matrix(xreg))
+      residuos_final <- residuals(modelo_arimax)
+      
+      cat(sprintf("\nModelo ARIMAX(%d,%d,%d) creado\n", p, d, q))
+      cat(sprintf(" - AIC: %.2f\n", modelo_arimax$aic))
+      cat(sprintf(" - Varianza residual: %.4f\n", var(residuos_final, na.rm = TRUE)))
+    } else {
+      cat("\nNo se requiere ARIMA (orden 0,0,0)\n")
+    }
+  }, error = function(e) {
+    cat(sprintf("\nError en auto.arima: %s\n", e$message))
+    cat("Usando modelo LM sin ARIMA\n")
+    p <- 0
+    d <- 0
+    q <- 0
+    modelo_arimax <- NULL
+    residuos_final <- residuos_lm
+  })
+  
+  cat(sprintf("\nModelo creado: %d filas usadas\n", nrow(modelo_df)))
+  
+  # --- 13. RETORNAR ---
+  list(
+    modelo_arimax = modelo_arimax,
+    lm_temp = lm_temp,
+    xreg = xreg,
+    y = y,
+    n = nrow(modelo_df),
+    n_total = sum(datos$estacion == estacion_sel),
+    vars_pred = names(xreg),
+    orden_lags = orden_lags,
+    orden_arima = c(p, d, q),
+    residuos = residuos_final,
+    modelo_df = modelo_df,
+    objetivo = objetivo,
+    estacion_sel = estacion_sel
+  )
+}
+```
+
+```{r}
+diagnosticar_arimax_completo <- function(res, objetivo, estacion_sel, orden_bg = 24) {
+  
+  modelo_arimax <- res$modelo_arimax
+  lm_temp <- res$lm_temp
+  residuos <- res$residuos
+  modelo_df <- res$modelo_df
+  y <- res$y
+  
+  cat(paste0("\n\n", paste(rep("=", 80), collapse = "")))
+  cat(paste0("\nDIAGNOSTICO COMPLETO ARIMAX — ", objetivo, " (", estacion_sel, ")"))
+  cat(paste0("\n", paste(rep("=", 80), collapse = "")))
+  
+  # --- 1. RESULTADOS GLOBALES ---
+  cat("\n\nRESUMEN GLOBAL DEL MODELO:\n")
+  
+  # Extraer R² del LM (siempre existe)
+  r2 <- summary(lm_temp)$r.squared
+  r2_adj <- summary(lm_temp)$adj.r.squared
+  f_stat <- summary(lm_temp)$fstatistic
+  f_pvalue <- pf(f_stat[1], f_stat[2], f_stat[3], lower.tail = FALSE)
+  
+  cat(paste0("   - Filas usadas: ", res$n, "\n"))
+  cat(paste0("   - Variables predictoras: ", length(coef(lm_temp)) - 1, "\n"))
+  cat(paste0("   - R² (LM): ", round(r2, 4), "\n"))
+  cat(paste0("   - R² ajustado (LM): ", round(r2_adj, 4), "\n"))
+  cat(paste0("   - F-statistic (LM): ", round(f_stat[1], 2), 
+             " (p-value: ", format(f_pvalue, scientific = TRUE, digits = 2), ")\n"))
+  
+  if (!is.null(modelo_arimax)) {
+    cat(paste0("   - AIC (ARIMAX): ", round(modelo_arimax$aic, 2), "\n"))
+    cat(paste0("   - Orden ARIMA: AR(", res$orden_arima[1], "), d=", 
+               res$orden_arima[2], ", MA(", res$orden_arima[3], ")\n"))
+  } else {
+    cat("   - Sin estructura ARIMA (LM puro)\n")
+  }
+  
+  cat(paste0("   - Rezagos usados: ", paste(res$orden_lags, collapse = ", "), "\n"))
+  
+  # --- 2. ESTADÍSTICAS DE RESIDUOS ---
+  cat("\n\nESTADISTICAS DE RESIDUOS:\n")
+  cat(paste0("   - Minimo: ", round(min(residuos), 4), "\n"))
+  cat(paste0("   - 1er Cuartil: ", round(quantile(residuos, 0.25), 4), "\n"))
+  cat(paste0("   - Mediana: ", round(median(residuos), 4), "\n"))
+  cat(paste0("   - 3er Cuartil: ", round(quantile(residuos, 0.75), 4), "\n"))
+  cat(paste0("   - Maximo: ", round(max(residuos), 4), "\n"))
+  cat(paste0("   - Desviacion estandar: ", round(sd(residuos), 4), "\n"))
+  cat(paste0("   - Media: ", round(mean(residuos), 4), " (debe ser ~0)\n"))
+  
+  # --- 3. GRÁFICOS DE DIAGNÓSTICO (LM) ---
+  cat("\n\nGRAFICOS DE DIAGNOSTICO (LM base):\n")
+  
+  cat("\n\n### 1. Residuos vs Valores Ajustados (LM)\n")
+  plot(lm_temp, which = 1, 
+       main = paste0("Residuos vs Valores Ajustados (", objetivo, " - ", estacion_sel, ")"))
+  
+  cat("\n\n### 2. QQ-plot (Normalidad) (LM)\n")
+  plot(lm_temp, which = 2, 
+       main = paste0("QQ-plot (Normalidad) (", objetivo, " - ", estacion_sel, ")"))
+  
+  cat("\n\n### 3. Escala-Ubicacion (Homocedasticidad) (LM)\n")
+  plot(lm_temp, which = 3, 
+       main = paste0("Escala-Ubicacion (Homocedasticidad) (", objetivo, " - ", estacion_sel, ")"))
+  
+  cat("\n\n### 4. Residuos vs Leverage (LM)\n")
+  plot(lm_temp, which = 4, 
+       main = paste0("Residuos vs Leverage (", objetivo, " - ", estacion_sel, ")"))
+  
+  # --- 4. PREDICCIONES VS OBSERVADOS ---
+  cat("\n\nPREDICCIONES VS VALORES OBSERVADOS:\n")
+  
+  ajustados <- fitted(lm_temp)
+  mae <- mean(abs(residuos), na.rm = TRUE)
+  rmse <- sqrt(mean(residuos^2, na.rm = TRUE))
+  
+  # Calcular MAPE con cuidado para evitar división por cero
+  y_pos <- y[y > 0]
+  if (length(y_pos) > 0) {
+    mape <- mean(abs(residuos[y > 0] / y_pos), na.rm = TRUE) * 100
+  } else {
+    mape <- NA
+  }
+  
+  cat(paste0("   - MAE (Error Absoluto Medio): ", round(mae, 4), "\n"))
+  cat(paste0("   - RMSE (Raiz del Error Cuadratico Medio): ", round(rmse, 4), "\n"))
+  if (!is.na(mape)) {
+    cat(paste0("   - MAPE (Error Porcentual Absoluto Medio): ", round(mape, 2), "%\n"))
+  }
+  
+  # Gráfico
+  library(ggplot2)
+  plot_df <- data.frame(
+    observado = y,
+    ajustado = ajustados
+  )
+  
+  p <- ggplot(plot_df, aes(x = observado, y = ajustado)) +
+    geom_point(alpha = 0.3, size = 0.8, color = "gray40") +
+    geom_abline(slope = 1, intercept = 0, color = "firebrick", linewidth = 1) +
+    geom_smooth(method = "lm", se = TRUE, color = "steelblue", alpha = 0.2) +
+    labs(
+      title = paste0("Predicciones vs Observados (LM) — ", objetivo, " (", estacion_sel, ")"),
+      x = paste0("Observado (", objetivo, ")"),
+      y = paste0("Predicho (", objetivo, ")"),
+      subtitle = paste0("R² = ", round(r2, 4), " | MAE = ", round(mae, 2), " | RMSE = ", round(rmse, 2))
+    ) +
+    theme_minimal() +
+    coord_fixed()
+  
+  print(p)
+  
+  # --- 5. PRUEBAS ESTADÍSTICAS ---
+  cat("\n\nPRUEBAS ESTADISTICAS:\n")
+  
+  # Normalidad
+  n_residuos <- length(residuos)
+  if (n_residuos <= 5000) {
+    test_normalidad <- shapiro.test(residuos)
+    nombre_test <- "Shapiro-Wilk"
+  } else {
+    test_normalidad <- nortest::ad.test(residuos)
+    nombre_test <- "Anderson-Darling"
+  }
+  
+  test_lilliefors <- nortest::lillie.test(residuos)
+  test_homocedasticidad <- lmtest::bptest(lm_temp)
+  test_bg <- lmtest::bgtest(lm_temp, order = min(orden_bg, nrow(modelo_df) - length(coef(lm_temp)) - 1))
+  test_lb <- Box.test(residuos, lag = min(orden_bg, length(residuos) - 1), type = "Ljung-Box")
+  
+  tabla_diagnostico <- tibble(
+    prueba = c(
+      paste("Normalidad -", nombre_test),
+      "Normalidad - Lilliefors (K-S corregido)",
+      "Homocedasticidad (Breusch-Pagan)",
+      paste0("Autocorrelacion (Breusch-Godfrey, orden ", min(orden_bg, nrow(modelo_df) - length(coef(lm_temp)) - 1), ")"),
+      paste0("Autocorrelacion (Ljung-Box, ", min(orden_bg, length(residuos) - 1), " rezagos)")
+    ),
+    estadistico = c(
+      round(unname(test_normalidad$statistic), 3),
+      round(unname(test_lilliefors$statistic), 3),
+      round(unname(test_homocedasticidad$statistic), 3),
+      round(unname(test_bg$statistic), 3),
+      round(unname(test_lb$statistic), 3)
+    ),
+    p_value = c(
+      signif(test_normalidad$p.value, 3),
+      signif(test_lilliefors$p.value, 3),
+      signif(test_homocedasticidad$p.value, 3),
+      signif(test_bg$p.value, 3),
+      signif(test_lb$p.value, 3)
+    ),
+    interpretacion = c(
+      ifelse(test_normalidad$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+      ifelse(test_lilliefors$p.value < 0.05, "Residuos NO normales", "Residuos normales"),
+      ifelse(test_homocedasticidad$p.value < 0.05, "Varianza NO constante", "Varianza constante"),
+      ifelse(test_bg$p.value < 0.05, "Autocorrelacion residual detectada", "Sin autocorrelacion residual"),
+      ifelse(test_lb$p.value < 0.05, "Autocorrelacion residual detectada", "Sin autocorrelacion residual")
+    )
+  )
+  
+  print(kable(tabla_diagnostico, format = "markdown"))
+  
+  # --- 6. ACF Y PACF ---
+  cat("\n\n*ACF de los residuos finales:*\n\n")
+  acf(residuos, main = paste("ACF de residuos —", objetivo, estacion_sel), lag.max = 40)
+  
+  cat("\n\n*PACF de los residuos finales:*\n\n")
+  pacf(residuos, main = paste("PACF de residuos —", objetivo, estacion_sel), lag.max = 40)
+  
+  # --- 7. VIF ---
+  cat("\n\nVIF (Factor de Inflacion de Varianza):\n")
+  cat("   * NOTA: VIF alto en TOUT2/log_SR/log_WSR es NORMAL por ser polinomicas\n\n")
+  
+  vif_vals <- car::vif(lm_temp)
+  vif_df <- tibble(
+    variable = names(vif_vals),
+    VIF = round(vif_vals, 2)
+  ) %>% arrange(desc(VIF))
+  
+  vif_df <- vif_df %>%
+    mutate(
+      tipo = case_when(
+        variable %in% c("TOUT2", "log_SR", "log_WSR") ~ "Polinomica (VIF alto esperado)",
+        variable %in% c("TOUT", "SR", "WSR") ~ "Lineal (relacionada con polinomica)",
+        TRUE ~ "Normal"
+      )
+    )
+  
+  print(kable(vif_df, format = "markdown"))
+  
+  # --- 8. COMPARACIÓN CONTRA MODELO INGENUO ---
+  cat("\n\nCOMPARACION CONTRA MODELO INGENUO (solo rezagos):\n")
+  
+  vars_lag <- grep(paste0("^", objetivo, "_lag"), names(modelo_df), value = TRUE)
+  
+  if (length(vars_lag) > 0) {
+    formula_naive <- as.formula(paste(objetivo, "~", paste(vars_lag, collapse = " + ")))
+    modelo_naive <- lm(formula_naive, data = modelo_df)
+    
+    r2_naive <- summary(modelo_naive)$r.squared
+    r2_completo <- r2
+    aporte_extra <- r2_completo - r2_naive
+    
+    cat(sprintf("   - R² ingenuo (solo rezagos): %.4f\n", r2_naive))
+    cat(sprintf("   - R² completo (con exógenas): %.4f\n", r2_completo))
+    cat(sprintf("   - Aporte de variables exógenas: +%.4f (%.1f%% del R² total)\n",
+                aporte_extra, 100 * aporte_extra / r2_completo))
+    
+    if (!is.na(aporte_extra) && aporte_extra / r2_completo > 0.30) {
+      cat("   - Las variables exógenas aportan significativamente\n")
+    } else if (!is.na(aporte_extra) && aporte_extra / r2_completo > 0.15) {
+      cat("   - Las variables exógenas aportan moderadamente\n")
+    } else {
+      cat("   - Las variables exógenas aportan poco (el modelo es casi puramente autoregresivo)\n")
+    }
+  } else {
+    cat("   No se encontraron rezagos en el modelo\n")
+  }
+  
+  # --- 9. CONCLUSIONES ---
+  cat("\n\nCONCLUSIONES:\n")
+  
+  if (!is.na(r2_adj) && r2_adj > 0.8) {
+    cat("   R² ajustado > 0.8 -> Excelente poder explicativo\n")
+  } else if (!is.na(r2_adj) && r2_adj > 0.6) {
+    cat("   R² ajustado > 0.6 -> Buen poder explicativo\n")
+  } else if (!is.na(r2_adj)) {
+    cat("   R² ajustado < 0.6 -> Poder explicativo moderado/bajo\n")
+  }
+  
+  if (test_normalidad$p.value > 0.05) {
+    cat("   Residuos normales -> Intervalos de confianza fiables\n")
+  } else {
+    cat("   Residuos NO normales -> Los p-values pueden no ser exactos\n")
+  }
+  
+  if (test_homocedasticidad$p.value > 0.05) {
+    cat("   Varianza constante -> Errores estandar fiables\n")
+  } else {
+    cat("   Varianza NO constante -> Usar errores estandar robustos\n")
+  }
+  
+  if (test_lb$p.value > 0.05) {
+    cat("   Sin autocorrelacion residual significativa\n")
+  } else {
+    cat("   Autocorrelacion residual detectada -> Considerar mas rezagos o estructura ARIMA\n")
+  }
+  
+  cat(paste0("\n", paste(rep("=", 80), collapse = "")))
+  cat("\n\n")
+}
+```
+
+```{r}
+#| label: arimax-SO
+#| warning: false
+#| results: asis
+
+cat("\n\n# MODELO ARIMAX CON EVALUACION COMPLETA - ESTACION SO\n\n")
+
+modelos_arimax_SO <- list()
+
+for (obj in TARGETS) {
+  cat(sprintf("\n\n## Modelo ARIMAX: %s (SO)\n", obj))
+  
+  res <- modelar_arimax(base_analisis, "SO", obj)
+  modelos_arimax_SO[[obj]] <- res
+  
+  if (is.null(res)) {
+    cat("No se pudo crear el modelo.\n")
+    next
+  }
+  
+  diagnosticar_arimax_completo(res, obj, "SO")
+  
+  cat("\n\n---\n")
+}
+```
+
