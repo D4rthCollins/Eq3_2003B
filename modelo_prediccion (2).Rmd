@@ -1,0 +1,880 @@
+---
+title: "Modelo de predicción de O3, PM10 y PM2.5"
+subtitle: "Entrenamiento con histórico + predicción sobre datos nuevos"
+author: "David Collins"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(zoo)
+library(knitr)
+library(writexl)
+library(ggplot2)
+library(forecast)
+library(car)
+library(sandwich)
+library(lmtest)
+```
+
+# 1. Configuración
+
+Ajusta estas rutas y parámetros según tu caso.
+
+```{r configuracion}
+# --- Estaciones y contaminantes objetivo ---
+STATIONS <- c("SO", "SE3", "NTE2")
+TARGETS  <- c("O3", "PM10", "PM2.5")
+
+# --- Archivos históricos para ENTRENAR el modelo ---
+archivos_entrenamiento <- list(
+  "2022" = "~/R_Multivariados/2003B_Blank/data/BD 2022.xlsx",
+  "2023" = "~/R_Multivariados/2003B_Blank/data/BD 2023.xlsx",
+  "2024" = "~/R_Multivariados/2003B_Blank/data/BD 2024.xlsx"
+)
+
+# --- Archivo(s) con datos NUEVOS a predecir ---
+# IMPORTANTE: para que los rezagos (ej. O3_lag1, O3_lag2) se puedan calcular, el archivo de datos nuevos debe incluir también algunas horas previas de "calentamiento" (idealmente al menos 24h antes del periodo que te interesa predecir), no solo las horas objetivo.
+
+archivo_datos_nuevos <- "~/R_Multivariados/2003B_Blank/data/BD 2025.xlsx"
+
+# --- Dónde guardar/cargar los modelos ya entrenados ---
+ruta_modelos <- "modelos_finales.rds"
+
+# --- Dónde exportar las predicciones resultantes ---
+ruta_salida_predicciones <- "predicciones.xlsx"
+```
+
+# 2. Funciones de carga y limpieza de datos
+
+```{r fn-carga}
+leer_estacion <- function(archivo, hoja, anio) {
+  raw <- read_excel(archivo, sheet = hoja)
+
+  names(raw) <- names(raw) %>%
+    str_remove("\\(.*\\)") %>%
+    str_trim()
+
+  names(raw)[1] <- "date"
+
+  raw %>%
+    mutate(date = as.POSIXct(date, tz = "America/Monterrey")) %>%
+    filter(!is.na(date)) %>%   # descarta la fila de unidades (si existe)
+    mutate(
+      across(-date, as.numeric),
+      estacion = hoja,
+      año = anio
+    ) %>%
+    select(año, estacion, date, everything())
+}
+
+cargar_multiples_anios <- function(archivos_por_anio, estaciones) {
+  map_dfr(names(archivos_por_anio), function(anio) {
+    archivo <- archivos_por_anio[[anio]]
+    map_dfr(estaciones, ~ leer_estacion(archivo, .x, as.numeric(anio)))
+  })
+}
+```
+
+# 3. Ingeniería de variables (compartida entre entrenamiento y predicción)
+
+Estas son las mismas transformaciones no lineales, cíclicas, de acumulación y de rezago que se determinaron como el modelo final. Se centralizan aquí en una sola función para garantizar que el entrenamiento y la predicción apliquen exactamente los mismos cálculos.
+
+```{r fn-features}
+agregar_variables_ciclicas <- function(df) {
+  df %>%
+    mutate(
+      hora     = lubridate::hour(date),
+      mes_num  = lubridate::month(date),
+      hora_sin = sin(2 * pi * hora / 24),
+      hora_cos = cos(2 * pi * hora / 24),
+      mes_sin  = sin(2 * pi * mes_num / 12),
+      mes_cos  = cos(2 * pi * mes_num / 12)
+    )
+}
+
+# Variables base y específicas por objetivo.
+# Los rezagos no se fijan aquí: se prueba un conjunto amplio de candidatos (1,2,3,6,12,24) y se seleccionan por VIF dentro de entrenar_modelo_final().
+
+CANDIDATOS_LAG <- c(1, 2, 3, 6, 12, 24)
+
+obtener_config_objetivo <- function(objetivo) {
+  vars_base <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", "PM10", "PM2.5")
+
+  if (objetivo == "O3") {
+    list(
+      vars_extra = c("WSR", "TOUT", "SR", "RH"),
+      vars_fijas = c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF",
+                      "PM10", "PM2.5", "WSR",
+                      "TOUT2", "log_SR", "RH_6h",
+                      "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    )
+  } else if (objetivo == "PM10") {
+    list(
+      vars_extra = c("TOUT", "SR", "WSR", "RH"),
+      vars_fijas = c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF",
+                      "PM10", "PM2.5", "TOUT", "SR",
+                      "log_WSR", "RH_12h",
+                      "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    )
+  } else if (objetivo == "PM2.5") {
+    list(
+      vars_extra = c("TOUT", "SR", "WSR", "RH"),
+      vars_fijas = c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF",
+                      "PM10", "PM2.5", "TOUT", "SR",
+                      "log_WSR", "RH_12h",
+                      "hora_sin", "hora_cos", "mes_sin", "mes_cos")
+    )
+  }
+}
+
+# Imputa un NA con el promedio de una ventana de horas anteriores. Esto evita  un poco la "línea diagonal" en residuos vs. ajustados. También reduce la autocorrelación artificial que ese bloque constante introducía (varios "iguales" seguidos infla la correlación entre rezagos consecutivos).
+
+# `lag(x, 1)` antes de la ventana asegura que sólo se use información previa al punto que se está imputando (nunca el valor futuro) -- así funciona igual en entrenamiento que en datos nuevos, sin depender de un promedio calculado de antemano en el entrenamiento.
+
+imputar_media_movil <- function(x, ventana = 24) {
+  x_previo <- dplyr::lag(x, 1)
+  media_previa <- zoo::rollapply(x_previo, width = ventana,
+                                  FUN = function(v) mean(v, na.rm = TRUE),
+                                  align = "right", partial = TRUE, fill = NA)
+
+  x_imputado <- ifelse(is.na(x), media_previa, x)
+
+  # Último recurso: si aún queda NA (ej. las primeras horas de toda la serie, sin suficiente historial previo), se usa la media global de la columna
+  
+  if (any(is.na(x_imputado))) {
+    media_global <- mean(x, na.rm = TRUE)
+    x_imputado <- ifelse(is.na(x_imputado), media_global, x_imputado)
+  }
+
+  x_imputado
+}
+
+# Calcula todas las variables derivadas (no lineales, acumulaciones, rezagos).
+calcular_features <- function(datos, estacion_sel, objetivo, ventana_imputacion = 24) {
+  cfg <- obtener_config_objetivo(objetivo)
+  vars_base_local <- c("NO", "NO2", "CO", "SO2", "WDR", "PRS", "RAINF", "PM10", "PM2.5")
+  vars_pred <- unique(c(vars_base_local, cfg$vars_extra))
+
+  df <- datos %>%
+    filter(estacion == estacion_sel) %>%
+    select(all_of(c("date", objetivo, vars_pred))) %>%
+    arrange(date) %>%
+    mutate(across(-date, ~ ifelse(.x < 0, NA, .x)))
+
+  # --- Imputación por media móvil del periodo anterior ---
+  cols_a_imputar <- setdiff(names(df), "date")
+  df <- df %>%
+    mutate(across(all_of(cols_a_imputar), ~ imputar_media_movil(.x, ventana = ventana_imputacion)))
+
+  df <- agregar_variables_ciclicas(df)
+
+  # --- Transformaciones no lineales y acumulaciones por objetivo ---
+  if (objetivo == "O3") {
+    df <- df %>%
+      mutate(
+        TOUT2  = TOUT^2,
+        log_SR = log(SR + 1),
+        RH_6h  = zoo::rollapply(RH, width = 6, FUN = mean, fill = NA,
+                                 align = "right", partial = TRUE)
+      )
+  } else if (objetivo %in% c("PM10", "PM2.5")) {
+    df <- df %>%
+      mutate(
+        log_WSR = log(WSR + 0.1),
+        RH_12h  = zoo::rollapply(RH, width = 12, FUN = mean, fill = NA,
+                                  align = "right", partial = TRUE)
+      )
+  }
+
+  # --- Rezagos candidatos: se calculan TODOS (1,2,3,6,12,24). La selección final de cuáles usar ocurre después, por VIF, en entrenar_modelo_final().
+  for (lag_i in CANDIDATOS_LAG) {
+    nombre_lag <- paste0(objetivo, "_lag", lag_i)
+    df[[nombre_lag]] <- dplyr::lag(df[[objetivo]], lag_i)
+  }
+  vars_lag_candidatas <- paste0(objetivo, "_lag", CANDIDATOS_LAG)
+
+  # Imputa NA generados por rezagos/acumulaciones (primeras filas) con media móvil también, para evitar bloques constantes al inicio
+  
+  cols_derivadas <- setdiff(names(df), c("date", cols_a_imputar, "hora", "mes_num",
+                                          "hora_sin", "hora_cos", "mes_sin", "mes_cos"))
+  df <- df %>%
+    mutate(across(all_of(cols_derivadas), ~ imputar_media_movil(.x, ventana = ventana_imputacion)))
+
+  list(datos = df, vars_fijas = cfg$vars_fijas, vars_lag_candidatas = vars_lag_candidatas)
+}
+```
+
+```{r fn-seleccion-lags-vif}
+# Parte de todos los rezagos candidatos y va descartando, uno por uno, el rezago con mayor VIF.
+
+seleccionar_lags_por_vif <- function(df, objetivo, vars_fijas, vars_lag_candidatas,
+                                      umbral_vif = 10) {
+  vars_lag_actuales <- vars_lag_candidatas
+
+  repeat {
+    if (length(vars_lag_actuales) == 0) break
+
+    vars_todas <- c(vars_fijas, vars_lag_actuales)
+    formula_tmp <- as.formula(paste0("`", objetivo, "` ~ ",
+                                      paste0("`", vars_todas, "`", collapse = " + ")))
+    modelo_tmp <- lm(formula_tmp, data = df)
+
+    vif_vals <- tryCatch(car::vif(modelo_tmp), error = function(e) NULL)
+    if (is.null(vif_vals)) break  # aliasing perfecto u otro problema numérico
+
+    vif_lags <- vif_vals[names(vif_vals) %in% vars_lag_actuales]
+    if (length(vif_lags) == 0 || max(vif_lags) <= umbral_vif) break
+
+    peor <- names(vif_lags)[which.max(vif_lags)]
+    vars_lag_actuales <- setdiff(vars_lag_actuales, peor)
+  }
+
+  vars_lag_actuales
+}
+```
+
+# 4.1 Entrenamiento del modelo final (3 etapas)
+
+Se ajustan y conservan **las 3 etapas** para poder comparar su desempeño:
+
+1. **`modelo_lm`**: regresión con exógenas + rezagos seleccionados por VIF (el modelo "antes de AR/MA").
+2. **`modelo_arima_solo`**: ARIMA puro sobre el contaminante, sin ninguna variable exógena — aísla cuánto explica solo la estructura temporal.
+3. **`modelo_arimax`**: el modelo final — regresión con errores ARIMA(p,d,q), usando las mismas variables exógenas de la etapa 1 más la corrección de autocorrelación.
+
+```{r fn-entrenar}
+entrenar_modelo_final <- function(datos, estacion_sel, objetivo) {
+  prep <- calcular_features(datos, estacion_sel, objetivo)
+  df_final <- prep$datos
+
+  vars_fijas <- intersect(prep$vars_fijas, names(df_final))
+  
+  # Blindaje contra fuga de datos: el objetivo NUNCA debe ser su propio predictor. Esto corrige el caso de PM10/PM2.5, donde ambas aparecían como predictoras fijas sin excluir cuál de las dos es el objetivo actual
+  # -- causaba colinealidad perfecta (R²=1) y el Hessiano singular en Arima().
+  
+  vars_fijas <- setdiff(vars_fijas, objetivo)
+  vars_lag_candidatas <- intersect(prep$vars_lag_candidatas, names(df_final))
+
+  # --- 1. Eliminar fijas con varianza cero ---
+  varianzas_fijas <- sapply(df_final[, vars_fijas], function(x) var(x, na.rm = TRUE))
+  vars_fijas <- vars_fijas[!(varianzas_fijas == 0 | is.na(varianzas_fijas))]
+
+  # --- 2. Selección de rezagos por VIF ---
+  lags_seleccionados <- seleccionar_lags_por_vif(df_final, objetivo, vars_fijas,
+                                                  vars_lag_candidatas, umbral_vif = 10)
+
+  vars_predictoras <- c(vars_fijas, lags_seleccionados)
+  modelo_df <- df_final %>% select(all_of(vars_predictoras), all_of(objetivo))
+
+  # --- 3. Eliminar columnas constantes o casi-constantes del X final ---
+  # (protección adicional antes de lm y Arima)
+  vars_predictoras <- vars_predictoras[
+    sapply(modelo_df[, vars_predictoras], function(x) {
+      v <- var(x, na.rm = TRUE)
+      !is.na(v) && v > 1e-10
+    })
+  ]
+  modelo_df <- modelo_df %>% select(all_of(vars_predictoras), all_of(objetivo))
+
+  # --- 4. Eliminar predictores con VIF > 10 (incluyendo fijas, no solo lags) ---
+  repeat {
+    if (length(vars_predictoras) <= 1) break
+    formula_tmp <- as.formula(paste0("`", objetivo, "` ~ ",
+                                     paste0("`", vars_predictoras, "`", collapse = " + ")))
+    modelo_tmp <- lm(formula_tmp, data = modelo_df)
+    vif_vals <- tryCatch(car::vif(modelo_tmp), error = function(e) NULL)
+    if (is.null(vif_vals)) break
+
+    vif_altos <- vif_vals[vif_vals > 10]
+    if (length(vif_altos) == 0) break
+
+    peor <- names(vif_altos)[which.max(vif_altos)]
+    vars_predictoras <- setdiff(vars_predictoras, peor)
+    modelo_df <- modelo_df %>% select(all_of(vars_predictoras), all_of(objetivo))
+  }
+
+  # Refrescar lags_seleccionados (por si el filtro VIF eliminó alguno)
+  lags_seleccionados <- intersect(lags_seleccionados, vars_predictoras)
+
+  # --- ETAPA 1: lm ---
+  modelo_lm <- lm(as.formula(paste0("`", objetivo, "` ~ .")),
+                   data = modelo_df, na.action = na.omit)
+
+  y <- modelo_df[[objetivo]]
+
+  # --- ETAPA 2: ARIMA puro ---
+  modelo_arima_solo <- tryCatch(
+    forecast::auto.arima(y, seasonal = TRUE,
+                          stepwise = TRUE, approximation = TRUE,
+                          max.p = 5, max.q = 5, max.d = 1,
+                          max.P = 0, max.Q = 0, max.D = 0),
+    error = function(e) NULL
+  )
+
+  # --- ETAPA 3: ARIMAX ---
+  X_matrix <- as.matrix(modelo_df[, vars_predictoras, drop = FALSE])
+
+  # Quitar columnas con varianza ~0 (protección extra)
+  vars_ok <- apply(X_matrix, 2, function(col) {
+    v <- var(col, na.rm = TRUE)
+    !is.na(v) && v > 1e-10
+  })
+  X_matrix <- X_matrix[, vars_ok, drop = FALSE]
+  vars_predictoras <- vars_predictoras[vars_ok]
+
+   orden_residuos <- tryCatch(
+    forecast::auto.arima(residuals(modelo_lm), seasonal = FALSE,
+                          stepwise = TRUE, approximation = TRUE,
+                          max.p = 5, max.q = 5, max.d = 1,
+                          max.P = 0, max.Q = 0, max.D = 0),
+    error = function(e) NULL
+  )
+  orden_pdq <- if (!is.null(orden_residuos)) {
+    arimaorder(orden_residuos)[c("p", "d", "q")]
+  } else {
+    c(p = 0, d = 0, q = 0)
+  }
+
+  modelo_arimax <- tryCatch(
+    forecast::Arima(y, order = orden_pdq, xreg = X_matrix),
+    error = function(e) {
+      message(sprintf("Arima falló para %s - %s: %s\nUsando lm como fallback.",
+                      estacion_sel, objetivo, e$message))
+      NULL
+    }
+  )
+
+  list(
+    modelo_lm           = modelo_lm,
+    modelo_arima_solo   = modelo_arima_solo,
+    modelo_arimax       = modelo_arimax,
+    orden_pdq           = orden_pdq,
+    lags_seleccionados  = lags_seleccionados,
+    lags_descartados    = setdiff(vars_lag_candidatas, lags_seleccionados),
+    estacion            = estacion_sel,
+    objetivo            = objetivo,
+    vars_modelo         = vars_predictoras,
+    n_entrenamiento     = nrow(modelo_df)
+  )
+}
+```
+
+# 5. Entrenar los modelos (# estaciones × # contaminantes)
+
+```{r entrenar-todos}
+# Cambia a FALSE si ya tienes un .rds guardado y sólo quieres predecir
+REENTRENAR <- TRUE
+
+if (REENTRENAR) {
+  base_completa_train <- cargar_multiples_anios(archivos_entrenamiento, STATIONS)
+
+  modelos_finales <- list()
+  for (est in STATIONS) {
+    for (obj in TARGETS) {
+      nombre <- paste0(est, "_", obj)
+      modelos_finales[[nombre]] <- entrenar_modelo_final(base_completa_train, est, obj)
+    }
+  }
+
+  saveRDS(modelos_finales, ruta_modelos)
+} else {
+  if (!file.exists(ruta_modelos)) {
+    stop(sprintf(
+      "No se encontró '%s' en el directorio de trabajo actual (%s). Verifica que el archivo esté en la misma carpeta que este .Rmd, o pon REENTRENAR <- TRUE para regenerarlo.",
+      ruta_modelos, getwd()
+    ))
+  }
+  modelos_finales <- readRDS(ruta_modelos)
+}
+
+tibble(
+  modelo = names(modelos_finales),
+  n_obs  = map_dbl(modelos_finales, "n_entrenamiento")
+) %>% kable()
+```
+
+## 5.0 Rezagos seleccionados por VIF (trazabilidad)
+
+```{r tabla-lags-seleccionados}
+tabla_lags <- map_dfr(names(modelos_finales), function(nombre) {
+  m <- modelos_finales[[nombre]]
+  tibble(
+    estacion = m$estacion,
+    objetivo = m$objetivo,
+    lags_usados = paste(gsub(paste0(m$objetivo, "_lag"), "", m$lags_seleccionados), collapse = ", "),
+    lags_descartados_por_vif = if (length(m$lags_descartados) > 0)
+      paste(gsub(paste0(m$objetivo, "_lag"), "", m$lags_descartados), collapse = ", ")
+    else "(ninguno)"
+  )
+})
+kable(tabla_lags, caption = "Rezagos candidatos: 1, 2, 3, 6, 12, 24 horas")
+```
+
+# 5.1 Validación en 3 etapas (AIC, R², RMSE)
+
+Compara el desempeño **dentro de la muestra de entrenamiento** en las 3 etapas: (1) modelo original antes de AR/MA, (2) después de aplicar ARIMA (sin exógenas), y (3) el modelo final con exógenas + corrección ARIMA.
+
+**Nota sobre las métricas**: R² tiene definición estándar solo para la etapa 1 (`lm`). Para las etapas 2 y 3 (objetos `Arima`) se reporta un **pseudo-R²** (correlación al cuadrado entre valores ajustados y observados) — es la forma convencional de hacerlos comparables, pero no es el R² de mínimos cuadrados propiamente dicho. El AIC sí es nativo y comparable directamente entre las 3 etapas.
+
+```{r fn-validacion-3-etapas}
+calcular_pseudo_r2 <- function(observado, ajustado) {
+  round(cor(observado, ajustado, use = "complete.obs")^2, 4)
+}
+
+validar_3_etapas <- function(modelo_entrenado) {
+  y <- modelo_entrenado$modelo_lm$model[[1]]
+
+  # Si Arima falló, marcar como NA
+  arima_ok    <- !is.null(modelo_entrenado$modelo_arima_solo)
+  arimax_ok   <- !is.null(modelo_entrenado$modelo_arimax)
+
+  tibble(
+    estacion = modelo_entrenado$estacion,
+    objetivo = modelo_entrenado$objetivo,
+    etapa = c("1. Original (antes de AR/MA)",
+              "2. ARIMA puro (sin exógenas)",
+              "3. ARIMAX final (exógenas + ARIMA)"),
+    AIC = c(
+      round(AIC(modelo_entrenado$modelo_lm), 1),
+      if (arima_ok)  round(modelo_entrenado$modelo_arima_solo$aic, 1) else NA_real_,
+      if (arimax_ok) round(modelo_entrenado$modelo_arimax$aic, 1)      else NA_real_
+    ),
+    R2 = c(
+      round(summary(modelo_entrenado$modelo_lm)$r.squared, 4),
+      if (arima_ok)  calcular_pseudo_r2(y, fitted(modelo_entrenado$modelo_arima_solo)) else NA_real_,
+      if (arimax_ok) calcular_pseudo_r2(y, fitted(modelo_entrenado$modelo_arimax))      else NA_real_
+    ),
+    RMSE = c(
+      round(sqrt(mean(residuals(modelo_entrenado$modelo_lm)^2)), 3),
+      if (arima_ok)  round(sqrt(mean(residuals(modelo_entrenado$modelo_arima_solo)^2)), 3) else NA_real_,
+      if (arimax_ok) round(sqrt(mean(residuals(modelo_entrenado$modelo_arimax)^2)), 3)      else NA_real_
+    )
+  )
+}
+
+tabla_validacion_completa <- map_dfr(modelos_finales, validar_3_etapas)
+kable(tabla_validacion_completa, caption = "Validación en 3 etapas: original, ARIMA puro, ARIMAX final")
+```
+
+# 5.2 Ecuaciones finales del modelo (ARIMAX)
+
+```{r fn-imprimir-ecuacion}
+imprimir_ecuacion_arimax <- function(modelo_entrenado) {
+  m <- modelo_entrenado$modelo_arimax
+
+  if (is.null(m)) {
+    cat(sprintf("\n\n**%s — %s**: ARIMAX no disponible (falló el ajuste). Se usó lm.\n\n",
+                modelo_entrenado$objetivo, modelo_entrenado$estacion))
+    return(invisible(NULL))
+  }
+
+  coefs <- coef(m)
+  vars_ar   <- coefs[grepl("^ar\\d+$", names(coefs))]
+  vars_ma   <- coefs[grepl("^ma\\d+$", names(coefs))]
+  vars_xreg <- coefs[!grepl("^ar\\d+$|^ma\\d+$|^intercept$", names(coefs))]
+
+  intercepto <- if ("intercept" %in% names(coefs)) coefs[["intercept"]] else 0
+
+  p <- modelo_entrenado$orden_pdq[["p"]]
+  q <- modelo_entrenado$orden_pdq[["q"]]
+
+  cat(sprintf("\n\n**%s — %s** (ARIMA orden p=%d, d=%d, q=%d, AIC=%.1f)\n\n",
+              modelo_entrenado$objetivo, modelo_entrenado$estacion,
+              p, modelo_entrenado$orden_pdq[["d"]], q, m$aic))
+
+  cat("*Componente de regresión (variables exógenas):*\n\n")
+  cat(sprintf("`%s = %.4f", modelo_entrenado$objetivo, intercepto))
+  for (nm in names(vars_xreg)) {
+    cat(sprintf(" + (%.4f × %s)", vars_xreg[[nm]], nm))
+  }
+  cat("`\n\n")
+
+  if (length(vars_ar) > 0) {
+    cat("*Componente autorregresivo del error (AR):*\n\n")
+    cat("`η_t = ", paste(sprintf("%.4f×η(t-%d)", vars_ar, seq_along(vars_ar)), collapse = " + "), "`\n\n")
+  }
+  if (length(vars_ma) > 0) {
+    cat("*Componente de media móvil del error (MA):*\n\n")
+    cat("`+ ", paste(sprintf("%.4f×ε(t-%d)", vars_ma, seq_along(vars_ma)), collapse = " + "), " + ε_t`\n\n")
+  }
+  cat("\n\n---\n\n")
+}
+
+for (nombre in names(modelos_finales)) {
+  imprimir_ecuacion_arimax(modelos_finales[[nombre]])
+}
+```
+
+# 5.3 Comparación contra el modelo ingenuo (solo rezagos)
+
+Aísla cuánto aportan realmente las variables exógenas (clima + precursores + corrección ARIMA) por encima de simplemente usar la inercia propia del contaminante. El modelo "ingenuo" solo usa los rezagos que ya sobrevivieron el filtro de VIF (`lags_seleccionados`), nada más.
+
+```{r fn-comparar-naive}
+comparar_vs_naive <- function(modelo_entrenado) {
+  objetivo <- modelo_entrenado$objetivo
+  estacion <- modelo_entrenado$estacion
+  lags     <- modelo_entrenado$lags_seleccionados
+
+  if (length(lags) == 0) {
+    warning(sprintf("%s - %s: no quedó ningún rezago tras el filtro de VIF; no se puede construir el modelo ingenuo.",
+                     objetivo, estacion))
+    return(NULL)
+  }
+
+  # Mismo data frame que se usó para ajustar modelo_lm, para comparar sobre exactamente las mismas observaciones
+  modelo_df <- modelo_entrenado$modelo_lm$model
+
+  formula_naive <- as.formula(paste0("`", objetivo, "` ~ ",
+                                      paste0("`", lags, "`", collapse = " + ")))
+  modelo_naive <- lm(formula_naive, data = modelo_df)
+
+  y <- modelo_df[[objetivo]]
+
+  tibble(
+    estacion  = estacion,
+    objetivo  = objetivo,
+    modelo    = c("Ingenuo (solo rezagos)", "ARIMAX completo (final)"),
+    variables = c(paste(lags, collapse = ", "), "exógenas + corrección ARIMA"),
+    R2   = c(round(summary(modelo_naive)$r.squared, 4),
+             round(calcular_pseudo_r2(y, fitted(modelo_entrenado$modelo_arimax)), 4)),
+    RMSE = c(round(sqrt(mean(residuals(modelo_naive)^2)), 3),
+             round(sqrt(mean(residuals(modelo_entrenado$modelo_arimax)^2)), 3)),
+    AIC  = c(round(AIC(modelo_naive), 1),
+             round(modelo_entrenado$modelo_arimax$aic, 1))
+  )
+}
+```
+
+```{r ejecutar-comparacion-naive}
+tabla_comparacion_naive <- map_dfr(modelos_finales, comparar_vs_naive)
+kable(tabla_comparacion_naive, caption = "Modelo ingenuo (solo rezagos) vs. ARIMAX completo, por estación y contaminante")
+```
+
+## Aporte real de las variables exógenas
+
+```{r resumen-aporte-exogenas}
+resumen_aporte <- tabla_comparacion_naive %>%
+  group_by(estacion, objetivo) %>%
+  summarise(
+    R2_ingenuo      = R2[modelo == "Ingenuo (solo rezagos)"],
+    R2_completo     = R2[modelo == "ARIMAX completo (final)"],
+    aporte_absoluto = round(R2_completo - R2_ingenuo, 4),
+    pct_del_R2_total = round(100 * aporte_absoluto / R2_completo, 1),
+    .groups = "drop"
+  )
+
+kable(resumen_aporte, caption = "Cuánto del R² total viene de las exógenas, por encima del ingenuo")
+```
+
+# 6. Predicción sobre datos nuevos
+
+```{r fn-predecir}
+predecir_nuevo <- function(modelo_entrenado, datos_nuevos) {
+  objetivo <- modelo_entrenado$objetivo
+  estacion <- modelo_entrenado$estacion
+
+  prep <- calcular_features(datos_nuevos, estacion, objetivo)
+  df_final <- prep$datos
+
+  vars_necesarias <- modelo_entrenado$vars_modelo
+  faltantes <- setdiff(vars_necesarias, names(df_final))
+  if (length(faltantes) > 0) {
+    stop(sprintf("Faltan variables requeridas por el modelo (%s, %s): %s",
+                  estacion, objetivo, paste(faltantes, collapse = ", ")))
+  }
+
+  fechas             <- df_final$date
+  valores_observados <- df_final[[objetivo]]
+  X_nuevo <- as.matrix(df_final[, vars_necesarias, drop = FALSE])
+
+  # --- Fallback si Arima no se pudo entrenar ---
+  if (is.null(modelo_entrenado$modelo_arimax)) {
+    prediccion <- as.numeric(predict(modelo_entrenado$modelo_lm,
+                                      newdata = df_final))
+    return(tibble(
+      date = fechas, estacion = estacion, objetivo = objetivo,
+      observado = valores_observados, predicho = prediccion
+    ))
+  }
+  
+    # Reutiliza los coeficientes ya entrenados (no se re-estima nada) aplicados a la serie nueva vía el argumento `model=`. Esto da predicciones "un paso adelante" usando los parámetros ARIMA ya fijos — apropiado tanto si hay observado (validación) como si no (pronóstico puro, y en ese caso se ignora internamente para el cálculo, forecast solo usa xreg).
+
+   y_para_ajustar <- if (all(is.na(valores_observados))) {
+    rep(0, nrow(df_final))
+  } else {
+    valores_observados
+  }
+
+  modelo_aplicado <- tryCatch(
+    forecast::Arima(y_para_ajustar, model = modelo_entrenado$modelo_arimax,
+                    xreg = X_nuevo),
+    error = function(e) {
+      message(sprintf("Arima falló al predecir %s - %s: %s\nUsando lm.",
+                      estacion, objetivo, e$message))
+      NULL
+    }
+  )
+
+  prediccion <- if (!is.null(modelo_aplicado)) {
+    as.numeric(fitted(modelo_aplicado))
+  } else {
+    as.numeric(predict(modelo_entrenado$modelo_lm, newdata = df_final))
+  }
+
+  tibble(
+    date = fechas, estacion = estacion, objetivo = objetivo,
+    observado = valores_observados, predicho = prediccion
+  )
+}
+```
+
+```{r cargar-datos-nuevos}
+datos_nuevos <- cargar_multiples_anios(
+  list("nuevo" = archivo_datos_nuevos),
+  STATIONS
+)
+```
+
+```{r ejecutar-predicciones}
+predicciones <- map_dfr(names(modelos_finales), function(nombre) {
+  predecir_nuevo(modelos_finales[[nombre]], datos_nuevos)
+})
+
+kable(head(predicciones, 20))
+```
+
+# 7. Análisis de precisión del modelo (sólo si son para validar)
+
+```{r metricas-precision}
+predicciones_evaluables <- predicciones %>% filter(!is.na(observado))
+
+hay_evaluacion <- nrow(predicciones_evaluables) > 0
+
+if (hay_evaluacion) {
+  metricas_precision <- predicciones_evaluables %>%
+    group_by(estacion, objetivo) %>%
+    summarise(
+      n_evaluado = n(),
+      R2   = round(cor(observado, predicho, use = "complete.obs")^2, 4),
+      MAE  = round(mean(abs(observado - predicho)), 3),
+      RMSE = round(sqrt(mean((observado - predicho)^2)), 3),
+      MAPE = round(mean(abs((observado - predicho) / observado), na.rm = TRUE) * 100, 2),
+      .groups = "drop"
+    )
+
+  kable(metricas_precision, caption = "Precisión del modelo por estación y contaminante")
+} else {
+  cat("Los datos nuevos no incluyen valores observados: predicción pura, sin métricas de precisión.")
+}
+```
+
+## 7.1 Predicho vs. observado
+
+```{r plot-precision-dispersión, fig.width=7, fig.height=5}
+if (hay_evaluacion) {
+  combinaciones <- predicciones_evaluables %>%
+    distinct(estacion, objetivo) %>%
+    arrange(estacion, objetivo)
+
+  for (i in seq_len(nrow(combinaciones))) {
+    est <- combinaciones$estacion[i]
+    obj <- combinaciones$objetivo[i]
+
+    datos_plot <- predicciones_evaluables %>%
+      filter(estacion == est, objetivo == obj)
+
+    r2_plot <- round(cor(datos_plot$observado, datos_plot$predicho, use = "complete.obs")^2, 3)
+
+    p <- ggplot(datos_plot, aes(x = observado, y = predicho)) +
+      geom_point(alpha = 0.25, size = 0.8, color = "steelblue") +
+      geom_abline(slope = 1, intercept = 0, color = "firebrick", linewidth = 0.8) +
+      annotate("label", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.3,
+               label = paste0("R² = ", r2_plot), size = 4, fontface = "bold",
+               fill = "white", label.size = 0.3) +
+      labs(
+        title = paste0("Predicho vs. Observado — ", obj, " (", est, ")"),
+        subtitle = "Línea roja = predicción perfecta (y = x)",
+        x = "Observado", y = "Predicho"
+      ) +
+      theme_minimal(base_size = 11)
+
+    print(p)
+  }
+}
+```
+
+## 7.2 Serie de tiempo: observado vs. predicho
+
+```{r plot-precision-serie, fig.width=8, fig.height=4}
+if (hay_evaluacion) {
+  for (i in seq_len(nrow(combinaciones))) {
+    est <- combinaciones$estacion[i]
+    obj <- combinaciones$objetivo[i]
+
+    datos_plot <- predicciones_evaluables %>%
+      filter(estacion == est, objetivo == obj) %>%
+      pivot_longer(c(observado, predicho), names_to = "tipo", values_to = "valor")
+
+    p <- ggplot(datos_plot, aes(x = date, y = valor, color = tipo)) +
+      geom_line(linewidth = 0.5) +
+      scale_color_manual(values = c("observado" = "red3", "predicho" = "grey30"),
+                          name = NULL) +
+      labs(
+        title = paste0("Observado vs. predicho — ", obj, " (", est, ")"),
+        x = NULL, y = NULL
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "top")
+
+    print(p)
+  }
+}
+```
+
+# 8. Exportar resultados
+
+Cada **estación** se exporta como una hoja distinta del Excel, y dentro de cada hoja, cada **contaminante** tiene sus propias columnas de observado y predicho (ej. `O3_observado`, `O3_predicho`, `PM10_observado`, ...).
+
+```{r exportar}
+construir_hojas_por_estacion <- function(predicciones) {
+  hojas <- list()
+  for (est in sort(unique(predicciones$estacion))) {
+    hojas[[est]] <- predicciones %>%
+      filter(estacion == est) %>%
+      select(date, objetivo, observado, predicho) %>%
+      pivot_wider(
+        id_cols = date,
+        names_from = objetivo,
+        values_from = c(observado, predicho),
+        names_glue = "{objetivo}_{.value}"
+      ) %>%
+      arrange(date)
+  }
+  hojas
+}
+
+hojas_excel <- construir_hojas_por_estacion(predicciones)
+write_xlsx(hojas_excel, ruta_salida_predicciones)
+
+cat("Predicciones guardadas en:", normalizePath(ruta_salida_predicciones, mustWork = FALSE), "\n")
+cat("Hojas generadas:", paste(names(hojas_excel), collapse = ", "), "\n")
+```
+
+# 9. Evaluación final de residuos (HAC + diagnóstico completo)
+
+Esta sección corre en dos partes, sobre dos objetos distintos, y es importante no confundirlas:
+
+- **HAC, Breusch-Pagan y Breusch-Godfrey** se calculan sobre `modelo_lm`, diagnostican si esa corrección era necesaria, y HAC da errores estándar válidos para esa etapa aunque haya heterocedasticidad/autocorrelación.
+- **ACF, PACF, Ljung-Box, residuos vs. ajustados y escala-ubicación** se calculan sobre `modelo_arimax`, confirman si, después de la corrección, los residuos ya se comportan como ruido blanco.
+
+```{r fn-diagnostico-final}
+diagnosticar_hac <- function(modelo_entrenado) {
+  m <- modelo_entrenado$modelo_lm
+  # HAC (Newey-West): corrige los errores estándar bajo heterocedasticidad y autocorrelación simultáneamente, sin cambiar los coeficientes estimados
+  vcov_hac <- sandwich::NeweyWest(m, prewhite = FALSE, adjust = TRUE)
+  tabla_hac <- lmtest::coeftest(m, vcov = vcov_hac)
+  as.data.frame(unclass(tabla_hac)) %>%
+    tibble::rownames_to_column("variable") %>%
+    mutate(across(where(is.numeric), ~ round(.x, 4)))
+}
+
+diagnosticar_residuos_final <- function(modelo_entrenado, orden_lb = 24) {
+  objetivo <- modelo_entrenado$objetivo
+  estacion <- modelo_entrenado$estacion
+
+  cat(sprintf("\n\n## %s — %s\n\n", objetivo, estacion))
+
+  # --- HAC sobre la etapa 1 (lm) ---
+  cat("**Errores estándar HAC (Newey-West) — etapa 1 (lm):**\n\n")
+  print(kable(diagnosticar_hac(modelo_entrenado)))
+
+  # --- Breusch-Pagan y Breusch-Godfrey sobre la etapa 1 (antes de ARIMA) ---
+  m_lm <- modelo_entrenado$modelo_lm
+  test_bp <- lmtest::bptest(m_lm)
+  test_bg <- lmtest::bgtest(m_lm, order = 4)
+
+  cat("\n\n**Diagnóstico antes de ARIMA (etapa 1):**\n\n")
+  tabla_antes <- tibble(
+    prueba = c("Homocedasticidad (Breusch-Pagan)",
+               "Autocorrelación (Breusch-Godfrey, orden 4)"),
+    estadistico = round(c(unname(test_bp$statistic), unname(test_bg$statistic)), 3),
+    p_value = signif(c(test_bp$p.value, test_bg$p.value), 3),
+    interpretacion = c(
+      ifelse(test_bp$p.value < 0.05, "Varianza NO constante", "Varianza constante"),
+      ifelse(test_bg$p.value < 0.05,
+             "Autocorrelación detectada (se corrige con ARIMA en etapa 3)",
+             "Sin autocorrelación")
+    )
+  )
+  print(kable(tabla_antes))
+
+  # --- Residuos del modelo final (etapa 3, ARIMAX) ---
+  residuos_final  <- as.numeric(residuals(modelo_entrenado$modelo_arimax))
+  ajustados_final <- as.numeric(fitted(modelo_entrenado$modelo_arimax))
+
+  test_lb <- Box.test(residuos_final, lag = orden_lb, type = "Ljung-Box")
+
+  cat("\n\n**Diagnóstico del modelo final (etapa 3, ARIMAX):**\n\n")
+  tabla_final <- tibble(
+    prueba = sprintf("Autocorrelación (Ljung-Box, %d rezagos)", orden_lb),
+    estadistico = round(unname(test_lb$statistic), 3),
+    p_value = signif(test_lb$p.value, 3),
+    interpretacion = ifelse(test_lb$p.value < 0.05,
+                             "Autocorrelación residual restante",
+                             "Sin autocorrelación restante (residuos ~ ruido blanco)")
+  )
+  print(kable(tabla_final))
+
+  # --- Gráficas de residuos finales, una por una ---
+  cat("\n\n*Residuos vs. Ajustados:*\n\n")
+  plot(ajustados_final, residuos_final,
+       xlab = "Ajustados", ylab = "Residuos",
+       main = paste("Residuos vs. Ajustados —", objetivo, estacion),
+       pch = 20, cex = 0.4)
+  abline(h = 0, col = "firebrick", lty = 2)
+
+  cat("\n\n*Escala-Ubicación (homocedasticidad):*\n\n")
+  resid_std <- residuos_final / sd(residuos_final, na.rm = TRUE)
+  plot(ajustados_final, sqrt(abs(resid_std)),
+       xlab = "Ajustados", ylab = "Raíz de |Residuos estandarizados|",
+       main = paste("Escala-Ubicación —", objetivo, estacion),
+       pch = 20, cex = 0.4)
+
+  cat("\n\n*ACF de los residuos:*\n\n")
+  acf(residuos_final, main = paste("ACF de residuos —", objetivo, estacion))
+
+  cat("\n\n*PACF de los residuos:*\n\n")
+  pacf(residuos_final, main = paste("PACF de residuos —", objetivo, estacion))
+
+  cat("\n\n---\n\n")
+}
+```
+
+```{r evaluacion-residuos-SO}
+#| results: asis
+for (nombre in names(modelos_finales)[grepl("^SO_", names(modelos_finales))]) {
+  diagnosticar_residuos_final(modelos_finales[[nombre]])
+}
+```
+
+```{r evaluacion-residuos-SE3}
+#| results: asis
+for (nombre in names(modelos_finales)[grepl("^SE3_", names(modelos_finales))]) {
+  diagnosticar_residuos_final(modelos_finales[[nombre]])
+}
+```
+
+```{r evaluacion-residuos-NTE2}
+#| results: asis
+for (nombre in names(modelos_finales)[grepl("^NTE2_", names(modelos_finales))]) {
+  diagnosticar_residuos_final(modelos_finales[[nombre]])
+}
+```
